@@ -1,8 +1,11 @@
-#pragma once
+ #pragma once
 
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <mutex>
+#include <cstdio>
+#include <vector>
 #include <even/NewtonSolver.h>
 #include <even/BjtModel.h>
 
@@ -28,7 +31,24 @@ public:
     struct CeResult { double vb, ve, vc; };
     struct PpState  { double vd, vo; };
 
-    void prepare (double sampleRate)
+    // Audio engine selection. Both modes share the precomputed static
+    // transfer curve (see buildTransferTable):
+    //
+    //   Live : pure per-sample Newton solves (the original behaviour;
+    //          validation/benchmark reference, not exposed in the UI)
+    //   Exact: table lookup seeds the Newton solves, which polish to the
+    //          usual 1e-10 tolerance. Result is within ~1e-10 of the Live
+    //          root -- far below one float32 ULP, so bit-transparent at the
+    //          plugin's output precision, at roughly half the CPU.
+    //   Fast : pure interpolated table lookup, no Newton in the audio path.
+    //          Validated against Live to a worst-case deviation below the
+    //          float32 LSB before being shipped as a selectable mode.
+    enum class Engine { Live, Exact, Fast };
+
+    void setEngine (Engine e) { engine = e; }
+    Engine getEngine() const { return engine; }
+
+    void prepare (double sampleRate, bool buildTable = true)
     {
         fs = sampleRate;
 
@@ -46,6 +66,19 @@ public:
         ppDcQuiescent = ppDc; // physical fallback seed for unconverged solves
         ppQuiescentVo = ppDc[1];
 
+        // Precompute the static transfer curve (both stages are memoryless:
+        // the only circuit memory lives in the one-pole filters). Built with
+        // the live Newton solves, warm-seeded along the sweep, so the table
+        // IS the solver's output. Shared across instances and rebuilt never
+        // (independent of sample rate and gain).
+        if (buildTable)
+        {
+            const auto& st = sharedTables();
+            table = st.main;
+            dense = st.dense;
+            micro = st.micro;
+        }
+
         // One-pole coefficients (transformer / coupling behaviour). These must
         // be set BEFORE the calibration run below, which exercises the real
         // signal chain (processSample depends on them).
@@ -55,8 +88,12 @@ public:
 
         // Calibrate normalization by running the real chain: with unity
         // normalization, measure the output for a -12 dBFS-ish sine and set
-        // the trim so 0 dB sensitivity passes it at unity.
+        // the trim so 0 dB sensitivity passes it at unity. Runs in Live mode
+        // so calibration never depends on the (possibly not-yet-built) table
+        // -- and so the calibration result is identical for every engine.
         normalization = 1.0;
+        const Engine savedEngine = engine;
+        engine = Engine::Live;
         {
             const double amp = 0.25, freq = 100.0;
             const int n = (int) (fs * 0.05);
@@ -69,6 +106,7 @@ public:
             if (peak > 1.0e-6)
                 normalization = amp / peak;
         }
+        engine = savedEngine;
 
         // The calibration run above exercises the real signal chain, which
         // drags the continuation states to wherever the last sine sample
@@ -84,28 +122,104 @@ public:
     struct DebugState { double vb, ve, vc, vd, vo, norm; double res; };
     DebugState debugState() const { return { dcSolution[0], dcSolution[1], dcSolution[2], ppDc[0], ppDc[1], normalization, lastResidual }; }
 
+#ifdef NEVE_TABLE_DEBUG
+    // Validation hook (harness only): table output vs a live solve at an
+    // arbitrary drive. The live solve mutates the seed state; validation
+    // instances are throwaway.
+    struct TableProbe { double tableVo, liveVo; };
+    TableProbe probeTable (double drive)
+    {
+        const double tableVo = evalTableVo (drive) - ppQuiescentVo;
+        const double live = solveOutput (drive);
+        return { tableVo, live };
+    }
+
+    // Table-build debug hook: one live solve step with continuation, exactly
+    // as the build sweeps do (advances the internal seed state).
+    double probeSweepVo (double drive) { return solveOutput (drive); }
+
+    // Debug hooks: stored knot values.
+    double debugMainKnot (int i) const  { return table[(size_t) i].vo; }
+    double debugDenseKnot (int i) const { return dense[(size_t) i]; }
+    void debugPrintMicro() const
+    {
+        for (const auto& w : micro)
+            printf ("micro window: %.6f .. %.6f (%zu pts)\n", w.d0, w.d1, w.vo.size());
+    }
+    mutable double lastDrive = 0.0;     // drive of the last processed sample
+    double debugDrive() const { return lastDrive; }
+#endif
+
     // gainKnob: -80..+10 dB, exactly like the 1073 sensitivity control.
     // Turning it *down* records hotter -> more drive into the saturation
     // stages; turning it up pads the input. 40 dB/knob-decade keeps the
     // sweep musically matched to the hardware's 5 dB steps.
-    void setGainDb (float db) { driveGain = std::pow (10.0f, -db / 40.0f); }
+    void setGainDb (float db)
+    {
+        driveGain = std::pow (10.0f, -db / 40.0f);
+        driveScale = (double) driveGain * inputScale; // hoisted per-sample multiply
+    }
+
+    // Process a block in place. Preferred over per-sample calls from the
+    // plugin's processBlock: keeps the hot loop in one function so the
+    // solver state and coefficients stay in registers across samples.
+    void process (float* samples, int numSamples)
+    {
+        for (int i = 0; i < numSamples; ++i)
+            samples[i] = processSample (samples[i]);
+    }
 
     float processSample (float in)
     {
         // --- Input transformer: step-up + LF pole (state-variable form) ---
         const double x = (double) in * transformerRatio;
+
+        // Digital-silence fast path: once the transformer state has decayed
+        // to nothing, a silent input is the DC operating point exactly -- no
+        // Newton solves needed, the one-poles stay at zero.
+        if (x == 0.0 && std::abs (inputHpZ) < 1.0e-15)
+        {
+            inputHpZ = outputHpZ = outputLpZ = 0.0;
+            return 0.0f;
+        }
+
         inputHpZ = inputHp * inputHpZ + (1.0 - inputHp) * x;
         const double xf = x - inputHpZ;                       // AC-coupled
-        const double drive = xf * (double) driveGain * inputScale;
+        const double drive = xf * driveScale;
+#ifdef NEVE_TABLE_DEBUG
+        lastDrive = drive; // harness observability; not in the plugin build
+#endif
 
-        // --- Class-A gain stage (3-node Newton nodal solve) ---
-        const auto op = ceSolve (drive, dcSolution);
-
-        // --- BA283 Class-AB output stage (2-node Newton nodal solve) ---
-        const auto out = ppSolve (op.vc, ppDc);
+        // --- Nonlinear stages: Live solve, table-seeded solve, or table ---
+        double y;
+        switch (engine)
+        {
+            case Engine::Fast:
+            {
+                y = evalTableVo (drive) - ppQuiescentVo;
+                break;
+            }
+            case Engine::Exact:
+            {
+                // Table-interpolated state as the Newton seed: within
+                // interpolation error of the root, so the polish converges
+                // in 1-2 iterations to the usual 1e-10 tolerance.
+                const auto tp = evalTable (drive);
+                even::NewtonSolver<3>::Vec ceSeed { tp.vb, tp.ve, tp.vc };
+                even::NewtonSolver<2>::Vec ppSeed { tp.vd, tp.vo };
+                const auto op = ceSolve (drive, ceSeed);
+                const auto out = ppSolve (op.vc, ppSeed);
+                y = out.vo - ppQuiescentVo;
+                break;
+            }
+            default: // Engine::Live -- original per-sample solves
+            {
+                y = solveOutput (drive);
+                break;
+            }
+        }
 
         // --- Output transformer: remove DC, shape band ---
-        double y = out.vo - ppQuiescentVo;
         outputHpZ = outputHp * outputHpZ + (1.0 - outputHp) * y;
         y = y - outputHpZ;
         outputLpZ = outputLp * outputLpZ + (1.0 - outputLp) * y;
@@ -113,7 +227,313 @@ public:
         return (float) (outputLpZ * normalization * outputTrim);
     }
 
+    // Validation/benchmark hook: Live-engine output through the same filter
+    // chain, regardless of the current engine selection. Run on a SEPARATE
+    // circuit instance (it advances the filter state).
+    float processSampleLive (float in)
+    {
+        const double x = (double) in * transformerRatio;
+        inputHpZ = inputHp * inputHpZ + (1.0 - inputHp) * x;
+        const double drive = (x - inputHpZ) * driveScale;
+        double y = solveOutput (drive);
+        outputHpZ = outputHp * outputHpZ + (1.0 - outputHp) * y;
+        y = y - outputHpZ;
+        outputLpZ = outputLp * outputLpZ + (1.0 - outputLp) * y;
+        return (float) (outputLpZ * normalization * outputTrim);
+    }
+
 private:
+    // Live Newton chain: Class-A stage solve feeding the push-pull stage.
+    // This is the behavioural definition of the model.
+    double solveOutput (double drive)
+    {
+        const auto op = ceSolve (drive, dcSolution);
+        const auto out = ppSolve (op.vc, ppDc);
+        return out.vo - ppQuiescentVo;
+    }
+
+    //==========================================================================
+    // Static transfer curve.
+    //
+    // Both nonlinear stages are algebraic, so the composed stage chain is a
+    // pure function of `drive`; the only circuit memory is in the one-pole
+    // filters. The curve is independent of sample rate and of the gain knob
+    // (the knob scales the lookup coordinate via driveScale, not the curve).
+    //
+    // Domain: the curve is exponentially saturated outside this range
+    // (validated: f identical to full double precision from |drive| ~ 130
+    // upward on the positive side and ~ -16 on the negative side; margins
+    // included). Clamped lookup beyond the edges.
+    static constexpr int    tableN   = 1 << 17; // 131072 points
+    static constexpr double tableDMin = -40.0;
+    static constexpr double tableDMax = 160.0;
+    // The push-pull turn-on region (drive ~ -2.6..+1.6) has a near-vertical
+    // stretch (slope up to ~5 per unit drive with curvature concentrated in
+    // a ~1e-2-wide window); a uniform table that resolves it everywhere else
+    // cannot also resolve it here. A dense sub-table covers just this zone.
+    static constexpr int    denseN    = 1 << 19;
+    static constexpr double denseDMin = -2.7;
+    static constexpr double denseDMax = 2.1;
+    // The junction limiters put a handful of near-kinks in the curve at
+    // isolated drive values (measured: 4 clusters outside the dense window,
+    // each only a few main-table knots wide). Around each cluster a small
+    // micro-table is built automatically; quintic interpolation across a
+    // kink at main-table spacing leaves ~1e-4 error, at micro spacing
+    // ~1e-10.
+    struct MicroWindow { double d0, d1; std::vector<double> vo; };
+    static constexpr int microN = 1 << 14;   // points per micro window
+    // Node states vb/ve float (they only seed the Newton polish in Exact
+    // mode); vc/vd/vo in double: vo is the audio in Fast mode (a float ULP
+    // near the 13 V rail is ~1e-6), and vc drives the push-pull stage.
+    struct TablePoint { double vb, ve, vc, vd, vo; };
+
+    struct SharedTables
+    {
+        std::vector<TablePoint> main;
+        std::vector<double> dense;
+        std::vector<MicroWindow> micro;
+    };
+
+    // The curve depends on neither sample rate nor gain, so one table is
+    // built per process and shared by every circuit instance.
+    static const SharedTables& sharedTables()
+    {
+        static SharedTables shared;
+        static std::once_flag once;
+        std::call_once (once, []
+        {
+            Neve1073Circuit scratch;
+            scratch.prepare (48000.0, /*buildTable=*/false); // DC + calibration only
+            scratch.buildTransferTable();
+            shared.main = std::move (scratch.table);
+            shared.dense = std::move (scratch.dense);
+            shared.micro = std::move (scratch.micro);
+        });
+        return shared;
+    }
+
+    void buildTransferTable()
+    {
+        table.assign ((size_t) tableN, {});
+        dense.assign ((size_t) denseN, 0.0);
+        const double hMain  = (tableDMax - tableDMin) / (double) (tableN - 1);
+        const double hDense = (denseDMax - denseDMin) / (double) (denseN - 1);
+
+        auto resetSeeds = [&]
+        {
+            dcSolution = ceDc;
+            ppDc = ppDcQuiescent;
+            lastCeVin = 0.0;
+        };
+        // Cold solve: every main-table knot starts from the quiescent
+        // operating point (plus the solver's internal homotopy). Warm
+        // continuation from the previous knot is NOT safe here: at high
+        // drive the composed system has a second, converged root sheet that
+        // the audio path's per-sample jumps never visit -- a cold solve
+        // reliably reproduces the branch the Live engine lands on.
+        auto solveInto = [&] (double drive, TablePoint& p)
+        {
+            resetSeeds();
+            const auto op = ceSolve (drive, dcSolution);
+            const auto out = ppSolve (op.vc, ppDc);
+            p.vb = op.vb; p.ve = op.ve;
+            p.vc = op.vc; p.vd = out.vd; p.vo = out.vo;
+        };
+        // Warm solve (for the dense window, which sits well inside the
+        // smooth region; outliers are caught by the scan below).
+        auto warmVo = [&] (double drive) -> double
+        {
+            const auto op = ceSolve (drive, dcSolution);
+            const auto out = ppSolve (op.vc, ppDc);
+            return out.vo;
+        };
+        auto coldVo = [&] (double drive) -> double
+        {
+            resetSeeds();
+            return warmVo (drive);
+        };
+
+        // Main table: cold solve at every knot.
+        for (int i = 0; i < tableN; ++i)
+            solveInto (tableDMin + (double) i * hMain, table[(size_t) i]);
+
+        // Dense sub-table over the push-pull turn-on window: warm-seeded
+        // fine sweep (fast), then an outlier scan -- a knot whose second
+        // difference against its neighbours is way above the curve's
+        // legitimate curvature there is re-solved cold.
+        for (int i = 0; i < denseN; ++i)
+            dense[(size_t) i] = warmVo (denseDMin + (double) i * hDense);
+        for (int i = 1; i < denseN - 1; ++i)
+        {
+            const double d2 = dense[(size_t) i + 1] - 2.0 * dense[(size_t) i]
+                            + dense[(size_t) i - 1];
+            if (std::abs (d2) > 1.0e-5)
+                dense[(size_t) i] = coldVo (denseDMin + (double) i * hDense);
+        }
+
+        // Main-table repair pass: verify every stored point against both
+        // stage residuals (the solver converges to 1e-10; a little slack
+        // avoids re-churn on borderline knots); re-solve any offender cold.
+        size_t repairedMain = 0;
+        for (int i = 0; i < tableN; ++i)
+        {
+            const double drive = tableDMin + (double) i * hMain;
+            auto& p = table[(size_t) i];
+
+            even::NewtonSolver<3>::Vec ceX { p.vb, p.ve, p.vc };
+            even::NewtonSolver<3>::Vec F3 {};
+            ceResidual (ce, drive, ceX, F3);
+            const double rCe = even::NewtonSolver<3>::norm (F3);
+
+            even::NewtonSolver<2>::Vec ppX { p.vd, p.vo };
+            even::NewtonSolver<2>::Vec F2 {};
+            ppResidual (pp, p.vc, ppX, F2);
+            const double rPp = even::NewtonSolver<2>::norm (F2);
+
+            if (rCe <= 1.0e-9 && rPp <= 1.0e-9)
+                continue;
+
+            solveInto (drive, p); // cold re-solve (seeds reset inside)
+            ++repairedMain;
+        }
+        // Micro windows around the remaining limiter kinks (outside the
+        // dense window): detect clusters of large second difference in the
+        // main table, pad, and build a fine warm-seeded vo sub-table per
+        // cluster (outliers re-solved cold, as in the dense window).
+        micro.clear();
+        const double d2Threshold = 3.0e-5;
+        const double pad = 32.0 * hMain;
+        int runStart = -1;
+        for (int i = 1; i <= tableN; ++i)
+        {
+            const bool steep = i < tableN - 1
+                && std::abs (table[(size_t) i + 1].vo - 2.0 * table[(size_t) i].vo
+                             + table[(size_t) i - 1].vo) > d2Threshold;
+            if (steep && runStart < 0)
+                runStart = i;
+            if (! steep && runStart >= 0)
+            {
+                const double w0 = std::max (tableDMin, tableDMin + (runStart - 1) * hMain - pad);
+                const double w1 = std::min (tableDMax, tableDMin + (i + 1) * hMain + pad);
+                runStart = -1;
+                if (w0 > denseDMin && w1 < denseDMax)
+                    continue; // already covered by the dense window
+                MicroWindow w { w0, w1, {} };
+                w.vo.assign ((size_t) microN, 0.0);
+                const double hm = (w1 - w0) / (double) (microN - 1);
+                for (int k = 0; k < microN; ++k)
+                    w.vo[(size_t) k] = warmVo (w0 + (double) k * hm);
+                for (int k = 1; k < microN - 1; ++k)
+                {
+                    const double d2 = w.vo[(size_t) k + 1] - 2.0 * w.vo[(size_t) k]
+                                    + w.vo[(size_t) k - 1];
+                    if (std::abs (d2) > 1.0e-5)
+                        w.vo[(size_t) k] = coldVo (w0 + (double) k * hm);
+                }
+                micro.push_back (std::move (w));
+            }
+        }
+#ifdef NEVE_TABLE_DEBUG
+        fprintf (stderr, "table build: repaired %zu main, %zu micro windows\n",
+                 repairedMain, micro.size());
+#endif
+    }
+
+    // Catmull-Rom interpolation of the table state at `drive`. Smooth (C1),
+    // exact at the knots, clamped outside the domain.
+    TablePoint evalTable (double drive) const
+    {
+        const double t = std::clamp ((drive - tableDMin) * ((tableN - 1) / (tableDMax - tableDMin)),
+                                     0.0, (double) (tableN - 1));
+        const int i = (int) t;
+        const double u = t - (double) i;
+
+        const auto p0 = table[(size_t) std::max (i - 1, 0)];
+        const auto p1 = table[(size_t) i];
+        const auto p2 = table[(size_t) std::min (i + 1, tableN - 1)];
+        const auto p3 = table[(size_t) std::min (i + 2, tableN - 1)];
+
+        const double u2 = u * u, u3 = u2 * u;
+        auto cr = [u, u2, u3] (double a, double b, double c, double d)
+        { return 0.5 * (2.0 * b + (c - a) * u
+                          + (2.0 * a - 5.0 * b + 4.0 * c - d) * u2
+                          + (3.0 * b - a - 3.0 * c + d) * u3); };
+
+        TablePoint r;
+        r.vb = (float) cr (p0.vb, p1.vb, p2.vb, p3.vb);
+        r.ve = (float) cr (p0.ve, p1.ve, p2.ve, p3.ve);
+        r.vc = (float) cr (p0.vc, p1.vc, p2.vc, p3.vc);
+        r.vd = (float) cr (p0.vd, p1.vd, p2.vd, p3.vd);
+        r.vo = (float) cr (p0.vo, p1.vo, p2.vo, p3.vo);
+        return r;
+    }
+
+    // High-order (6-point quintic Lagrange) interpolation of the output
+    // node for the Fast engine: with a plain cubic, the sharp conduction
+    // knee of the transfer curve leaves ~1e-5 absolute interpolation error;
+    // quintic drops it below the float32 LSB without densifying the table.
+    double evalTableVo (double drive) const
+    {
+        for (const auto& w : micro)
+            if (drive >= w.d0 && drive <= w.d1)
+                return quinticVo (w.vo.data(), (int) w.vo.size(), w.d0, w.d1, drive);
+        if (drive >= denseDMin && drive <= denseDMax)
+            return quinticVo (dense.data(), (int) dense.size(), denseDMin, denseDMax, drive);
+        return quinticVoMain (drive);
+    }
+
+private:
+    double quinticVoMain (double drive) const
+    {
+        const double tPos = std::clamp ((drive - tableDMin) * ((tableN - 1) / (tableDMax - tableDMin)),
+                                        0.0, (double) (tableN - 1));
+        const int i = (int) tPos;
+        const double u = tPos - (double) i;
+        double v[6];
+        for (int k = 0; k < 6; ++k)
+            v[k] = table[(size_t) std::min (std::max (i + k - 2, 0), tableN - 1)].vo;
+        return lagrange6 (v, u);
+    }
+
+    static double quinticVo (const double* vo, int n,
+                             double d0, double d1, double drive)
+    {
+        const double tPos = std::clamp ((drive - d0) * ((n - 1) / (d1 - d0)),
+                                        0.0, (double) (n - 1));
+        const int i = (int) tPos;
+        const double u = tPos - (double) i; // in [0,1] between knot i and i+1
+
+        double v[6];
+        for (int k = 0; k < 6; ++k)
+            v[k] = vo[std::min (std::max (i + k - 2, 0), n - 1)];
+
+        return lagrange6 (v, u);
+    }
+
+    static double lagrange6 (const double* v, double u)
+    {
+        double y = 0.0;
+        for (int k = 0; k < 6; ++k)
+        {
+            double w = 1.0;
+            for (int m = 0; m < 6; ++m)
+                if (m != k)
+                    w *= (u - (double) (m - 2)) / (double) (k - m);
+            y += w * v[k];
+        }
+        return y;
+    }
+
+public:
+
+    Engine engine = Engine::Exact;
+    std::vector<TablePoint> table;
+    std::vector<double> dense; // vo only (Fast engine reads just the output node)
+    std::vector<MicroWindow> micro;
+
+public:
+    //==========================================================================
+
     static constexpr double transformerRatio = 2.0;  // LO1166, 1:2 step-up
     static constexpr double inputScale       = 2.5;  // attenuator + drive in
     static constexpr double outputTrim       = 1.0;
@@ -140,6 +560,17 @@ private:
                             const even::NewtonSolver<3>::Vec& x,
                             even::NewtonSolver<3>::Vec& F)
     {
+        ceEvaluate (s, vin, x, F, nullptr);
+    }
+
+    // Residual and Jacobian in one pass: both need the same BjtModel
+    // operating point, so the junction exponentials are evaluated once.
+    // J == nullptr means residual-only (line search / verification calls).
+    static void ceEvaluate (const CeStage& s, double vin,
+                            const even::NewtonSolver<3>::Vec& x,
+                            even::NewtonSolver<3>::Vec& F,
+                            even::NewtonSolver<3>::Mat* J)
+    {
         const double vb = x[0], ve = x[1], vc = x[2];
         const auto op = s.q.eval (vb - ve, vb - vc);
 
@@ -150,32 +581,29 @@ private:
         // Collector: current into the collector comes through the load from
         // the supply.
         F[2] = (vc - s.vcc) / s.rc + op.ic;
-    }
 
-    static void ceJacobian (const CeStage& s,
-                            const even::NewtonSolver<3>::Vec& x,
-                            even::NewtonSolver<3>::Mat& J)
-    {
-        const auto op = s.q.eval (x[0] - x[1], x[0] - x[2]);
+        if (J == nullptr)
+            return;
 
-        for (auto& row : J) row.fill (0.0);
+        auto& j = *J;
+        for (auto& row : j) row.fill (0.0);
 
         // dF0/dv*
-        J[0][0] = 1.0 / s.rs + 1.0 / s.rb1 + 1.0 / s.rb2 + op.dib_dvbe + op.dib_dvbc;
-        J[0][1] = -op.dib_dvbe;
-        J[0][2] = -op.dib_dvbc;
+        j[0][0] = 1.0 / s.rs + 1.0 / s.rb1 + 1.0 / s.rb2 + op.dib_dvbe + op.dib_dvbc;
+        j[0][1] = -op.dib_dvbe;
+        j[0][2] = -op.dib_dvbc;
         // dF1/dv*  (F1 = ve/Re - Ic - Ib; vbe = vb-ve, vbc = vb-vc)
-        J[1][0] = -(op.dic_dvbe + op.dic_dvbc) - (op.dib_dvbe + op.dib_dvbc);
-        J[1][1] = 1.0 / s.re + op.dic_dvbe + op.dib_dvbe;
+        j[1][0] = -(op.dic_dvbe + op.dic_dvbc) - (op.dib_dvbe + op.dib_dvbc);
+        j[1][1] = 1.0 / s.re + op.dic_dvbe + op.dib_dvbe;
         // vbc = vb - vc: dvbc/dvc = -1, and F1 subtracts both currents, so the
         // two negatives cancel -> positive sign. Getting this wrong makes the
         // full Newton step an ASCENT direction on ||F|| in deep saturation,
         // which the line search can never repair (the stuck-state bug).
-        J[1][2] = op.dic_dvbc + op.dib_dvbc;
+        j[1][2] = op.dic_dvbc + op.dib_dvbc;
         // dF2/dv*  (F2 = (vc-Vcc)/Rc + Ic)
-        J[2][0] = op.dic_dvbe + op.dic_dvbc;
-        J[2][1] = -op.dic_dvbe;
-        J[2][2] = 1.0 / s.rc - op.dic_dvbc;
+        j[2][0] = op.dic_dvbe + op.dic_dvbc;
+        j[2][1] = -op.dic_dvbe;
+        j[2][2] = 1.0 / s.rc - op.dic_dvbc;
     }
 
     CeResult ceSolve (double vin, even::NewtonSolver<3>::Vec& seed) const
@@ -195,31 +623,26 @@ private:
         // The first *converged* result wins; homotopy makes that essentially
         // always happen, so a non-root iterate is never handed to the audio
         // path (which is what produced the jagged, multi-valued clip tops).
-        auto solveAt = [] (auto& res, auto& jv, double v,
-                           even::NewtonSolver<3>::Vec x)
+        auto solveAt = [stage = &ce] (double v, even::NewtonSolver<3>::Vec x)
         {
-            auto r = even::NewtonSolver<3>::solve (
-                [&] (const even::NewtonSolver<3>::Vec& xv,
-                     even::NewtonSolver<3>::Vec& F) { res (xv, F, v); },
-                [&] (const even::NewtonSolver<3>::Vec& xv,
-                     even::NewtonSolver<3>::Mat& J) { jv (xv, J, v); },
-                x, 64);
+            auto ev = [stage, v] (const even::NewtonSolver<3>::Vec& xv,
+                                  even::NewtonSolver<3>::Vec& F,
+                                  even::NewtonSolver<3>::Mat& J)
+            { ceEvaluate (*stage, v, xv, F, &J); };
+            auto ro = [stage, v] (const even::NewtonSolver<3>::Vec& xv,
+                                  even::NewtonSolver<3>::Vec& F)
+            { ceEvaluate (*stage, v, xv, F, nullptr); };
+            auto r = even::NewtonSolver<3>::solveCombined (ev, ro, x, 64);
             return std::make_pair (x, r);
         };
 
-        auto residual = [&] (const even::NewtonSolver<3>::Vec& x,
-                             even::NewtonSolver<3>::Vec& F, double v)
-        { ceResidual (ce, v, x, F); };
-        auto jac = [&] (const even::NewtonSolver<3>::Vec& x,
-                        even::NewtonSolver<3>::Mat& J, double)
-        { ceJacobian (ce, x, J); };
-
         // 1. direct continuation
-        auto direct = solveAt (residual, jac, vin, seed);
+        auto direct = solveAt (vin, seed);
         if (direct.second.converged)
         {
             seed = direct.first;
             lastCeVin = vin;
+            lastResidual = 0.0;
             return { seed[0], seed[1], seed[2] };
         }
 
@@ -237,7 +660,7 @@ private:
             for (int k = 1; k <= nSub; ++k)
             {
                 const double vk = v0 + (vin - v0) * (double) k / (double) nSub;
-                auto sub = solveAt (residual, jac, vk, x);
+                auto sub = solveAt (vk, x);
                 x = sub.first;
                 if (! sub.second.converged && sub.second.residualNorm < bestRes)
                 {
@@ -248,7 +671,7 @@ private:
 
             // Verify the final state actually is a root at vin.
             even::NewtonSolver<3>::Vec Fv {};
-            residual (x, Fv, vin);
+            ceResidual (ce, vin, x, Fv);
             haveConverged = std::isfinite (Fv[0]) && std::isfinite (Fv[1])
                          && std::isfinite (Fv[2])
                          && even::NewtonSolver<3>::norm (Fv) < 1.0e-6;
@@ -270,7 +693,7 @@ private:
             };
             for (const auto& s0 : seeds)
             {
-                auto attempt = solveAt (residual, jac, vin, s0);
+                auto attempt = solveAt (vin, s0);
                 if (attempt.second.converged) { best = attempt.first; haveConverged = true; break; }
                 if (attempt.second.residualNorm < bestRes) { bestRes = attempt.second.residualNorm; best = attempt.first; }
             }
@@ -289,9 +712,16 @@ private:
 
         seed = best;
         lastCeVin = vin;
+        // Debug residual: only meaningful for the non-root fallback path; a
+        // converged state needs no extra residual evaluation here.
+        if (haveConverged)
+        {
+            lastResidual = 0.0;
+        }
+        else
         {
             even::NewtonSolver<3>::Vec Fr {};
-            residual (seed, Fr, vin);
+            ceResidual (ce, vin, seed, Fr);
             lastResidual = even::NewtonSolver<3>::norm (Fr);
         }
         return { seed[0], seed[1], seed[2] };
@@ -316,13 +746,24 @@ private:
                             const even::NewtonSolver<2>::Vec& x,
                             even::NewtonSolver<2>::Vec& F)
     {
+        ppEvaluate (s, vin, x, F, nullptr);
+    }
+
+    // Residual and Jacobian in one pass: both use the same junction limiting
+    // and exponential evaluations. J == nullptr means residual-only.
+    static void ppEvaluate (const PushPullStage& s, double vin,
+                            const even::NewtonSolver<2>::Vec& x,
+                            even::NewtonSolver<2>::Vec& F,
+                            even::NewtonSolver<2>::Mat* J)
+    {
         const double vd = x[0], vo = x[1];
         const double vN = even::BjtModel::lim (vd - vo - s.bias); // NPN junction
         const double vP = even::BjtModel::lim (vo - vd - s.bias); // PNP junction
         const double lN = even::BjtModel::limd (vd - vo - s.bias);
         const double lP = even::BjtModel::limd (vo - vd - s.bias);
-        const double eN = even::BjtModel::ex (vN / s.Vt);
-        const double eP = even::BjtModel::ex (vP / s.Vt);
+        double eN, dN, eP, dP;
+        even::BjtModel::exPair (vN / s.Vt, eN, dN);
+        even::BjtModel::exPair (vP / s.Vt, eP, dP);
         const double iN = s.IsP * (eN - 1.0);            // sources output node
         const double iP = s.IsP * (eP - 1.0);            // sinks output node
         const double iSum = iN - iP;
@@ -331,43 +772,38 @@ private:
         F[0] = (vd - vin) / s.rs + (vd - vo) / s.rf + iSum / (1.0 + s.beta);
         // Output node: device current must feed load + feedback return.
         F[1] = -iSum + vo / s.rl + (vo - vd) / s.rf;
-    }
 
-    static void ppJacobian (const PushPullStage& s,
-                            const even::NewtonSolver<2>::Vec& x,
-                            even::NewtonSolver<2>::Mat& J)
-    {
-        const double vd = x[0], vo = x[1];
-        const double vN = even::BjtModel::lim (vd - vo - s.bias);
-        const double vP = even::BjtModel::lim (vo - vd - s.bias);
-        const double lN = even::BjtModel::limd (vd - vo - s.bias);
-        const double lP = even::BjtModel::limd (vo - vd - s.bias);
-        const double gN = s.IsP / s.Vt * even::BjtModel::exd (vN / s.Vt) * lN;
-        const double gP = s.IsP / s.Vt * even::BjtModel::exd (vP / s.Vt) * lP;
+        if (J == nullptr)
+            return;
+
+        const double gN = s.IsP / s.Vt * dN * lN;
+        const double gP = s.IsP / s.Vt * dP * lP;
         const double gb = 1.0 / (1.0 + s.beta);
 
-        for (auto& row : J) row.fill (0.0);
+        auto& j = *J;
+        for (auto& row : j) row.fill (0.0);
 
         // diSum/dvd = gN + gP ; diSum/dvo = -(gN + gP)
         const double g = gN + gP;
 
-        J[0][0] = 1.0 / s.rs + 1.0 / s.rf + g * gb;
-        J[0][1] = -1.0 / s.rf - g * gb;
-        J[1][0] = -g - 1.0 / s.rf;
-        J[1][1] = g + 1.0 / s.rl + 1.0 / s.rf;
+        j[0][0] = 1.0 / s.rs + 1.0 / s.rf + g * gb;
+        j[0][1] = -1.0 / s.rf - g * gb;
+        j[1][0] = -g - 1.0 / s.rf;
+        j[1][1] = g + 1.0 / s.rl + 1.0 / s.rf;
     }
 
     PpState ppSolve (double vin, even::NewtonSolver<2>::Vec& seed) const
     {
-        auto residual = [&] (const even::NewtonSolver<2>::Vec& x,
-                             even::NewtonSolver<2>::Vec& F)
-        { ppResidual (pp, vin, x, F); };
-        auto jac = [&] (const even::NewtonSolver<2>::Vec& x,
-                        even::NewtonSolver<2>::Mat& J)
-        { ppJacobian (pp, x, J); };
+        auto evaluate = [&] (const even::NewtonSolver<2>::Vec& x,
+                             even::NewtonSolver<2>::Vec& F,
+                             even::NewtonSolver<2>::Mat& J)
+        { ppEvaluate (pp, vin, x, F, &J); };
+        auto residualOnly = [&] (const even::NewtonSolver<2>::Vec& x,
+                                 even::NewtonSolver<2>::Vec& F)
+        { ppEvaluate (pp, vin, x, F, nullptr); };
 
         auto firstAttempt = seed;
-        auto r1 = even::NewtonSolver<2>::solve (residual, jac, firstAttempt);
+        auto r1 = even::NewtonSolver<2>::solveCombined (evaluate, residualOnly, firstAttempt);
 
         // Same nonphysical-iterate guard as the Class-A stage: retry from the
         // quiescent state, but prefer a *converged* attempt over one that
@@ -375,8 +811,8 @@ private:
         if (! r1.converged)
         {
             auto retry = ppDcQuiescent;
-            auto r2 = even::NewtonSolver<2>::solve (residual, jac, retry, 64);
-            if (r2.converged && ! r1.converged)
+            auto r2 = even::NewtonSolver<2>::solveCombined (evaluate, residualOnly, retry, 64);
+            if (r2.converged)
             {
                 firstAttempt = retry;
                 r1 = r2;
@@ -401,6 +837,7 @@ private:
 
     double fs = 48000.0;
     float  driveGain = 1.0f;
+    double driveScale = inputScale; // driveGain * inputScale, set by setGainDb
 
     double inputHp = 0.0, inputHpZ = 0.0;
     double outputHp = 0.0, outputHpZ = 0.0;

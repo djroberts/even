@@ -41,9 +41,19 @@ public:
         0.0f
     };
 
+    // Engine selection (dropdown). "Exact" = precomputed curve seeds the
+    // Newton solves, which polish to full solver tolerance (quality-neutral,
+    // bit-transparent at float32). "Fast" = pure curve lookup, no Newton in
+    // the audio path (validated below the float32 LSB; lowest CPU).
+    juce::AudioParameterChoice qualityParam {
+        "quality", "Engine", juce::StringArray { "Exact", "Fast" }, 0
+    };
+
 private:
     std::atomic<float> gainDb { 0.0f };
+    std::atomic<int>   engineMode { 0 }; // 0 = Exact, 1 = Fast
     Neve1073Circuit circuit[2];
+    float lastGain[2] = { -999.0f, -999.0f }; // last value handed to setGainDb
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Neve1073AudioProcessor)
 };

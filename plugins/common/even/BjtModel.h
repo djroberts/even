@@ -63,6 +63,16 @@ struct BjtModel
         return k * std::exp (x0) * std::exp ((x - x0) * k);
     }
 
+    // e = ex(x) and d = exd(x) from a SINGLE exp evaluation. Hot-path helper:
+    // residual and Jacobian always need both, and exp is the dominant cost.
+    static void exPair (double x, double& e, double& d)
+    {
+        constexpr double x0 = 30.0;
+        constexpr double k  = 0.15;
+        if (x <= x0) { e = std::exp (x); d = e; }
+        else { e = std::exp (x0) * std::exp ((x - x0) * k); d = k * e; }
+    }
+
     Operating eval (double vbeIn, double vbcIn) const
     {
         // Junction limiting: beyond +/-0.7 V the junction voltage is allowed
@@ -73,14 +83,15 @@ struct BjtModel
         // (large-signal audio sweeps).
         const double vbe = lim (vbeIn), vbc = lim (vbcIn);
 
-        const double eF  = ex (vbe / Vt); // exp(vbe/Vt)
-        const double eR  = ex (vbc / Vt);
+        double eF, dF, eR, dR;
+        exPair (vbe / Vt, eF, dF);  // exp(vbe/Vt) and its derivative
+        exPair (vbc / Vt, eR, dR);  // exp(vbc/Vt) and its derivative
         const double if_ = Is * (eF - 1.0);
         const double ir  = Is * (eR - 1.0);
         // Consistent derivatives: d(e)/dv uses the tapered-slope form so the
         // Jacobian matches the residual even deep in the saturation tail.
-        const double gF  = Is / Vt * exd (vbe / Vt);  // d(exp)/dv
-        const double gR  = Is / Vt * exd (vbc / Vt);
+        const double gF  = Is / Vt * dF;  // d(exp)/dv
+        const double gR  = Is / Vt * dR;
 
         Operating op;
         op.ic = if_ - ir - ir / betaR;

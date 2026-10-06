@@ -35,5 +35,10 @@ private:
     juce::Label  gainLabel { {}, "GAIN" };
     juce::SliderParameterAttachment gainAttachment;
 
+    // Engine selection (Exact / Fast) shown as a small console dropdown.
+    juce::ComboBox engineBox;
+    juce::Label    engineLabel { {}, "ENGINE" };
+    juce::ComboBoxParameterAttachment engineAttachment;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Neve1073AudioProcessorEditor)
 };

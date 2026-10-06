@@ -1,0 +1,76 @@
+Review of the Neve 1073 preamp algorithm in djroberts/even (primarily Neve1073Circuit.h + supporting BjtModel.h / NewtonSolver.h).
+This is a serious, physically-grounded circuit-level model rather than a black-box waveshaper or simple transfer-curve emulation. It is one of the more ambitious open-source attempts at a true “component-level” 1073 preamp.
+Signal path modelled
+
+Input transformer (Marinair LO1166 style)
+Fixed 1:2 step-up (transformerRatio = 2.0).
+One-pole high-pass (~12 Hz) for LF roll-off / AC coupling.
+
+Sensitivity / attenuator network (the “gain knob”)
+setGainDb(-80…+10) is mapped as
+driveGain = 10^(-db/40).
+Turning the knob down (more negative) increases drive into the saturation stages — exactly the classic 1073 behaviour.
+Extra fixed inputScale = 2.5.
+
+Class-A common-emitter stage (BA215/BA284 style)
+3-node MNA + Newton-Raphson.
+Nodes: base, emitter, collector.
+Self-biased divider, emitter degeneration (Re = 470 Ω), collector load (Rc = 3.3 kΩ), 24 V rail.
+Full Ebers-Moll BJT model with analytic derivatives.
+
+BA283-style Class-AB output stage
+2-node MNA + Newton.
+Complementary pair with ~2·Vbe bias spreader, local feedback, reflected 600 Ω load.
+Simplified exponential model (not full Ebers-Moll for the output devices).
+
+Output transformer / coupling
+DC removal + one-pole HP (~8 Hz) + gentle LP (~48 kHz) for iron + silicon HF loss.
+Auto-calibration of overall normalisation so 0 dB sensitivity is roughly unity-gain.
+
+
+Strengths
+
+Real nonlinear circuit solving
+Newton-Raphson with damped line search, partial-pivoting Gaussian elimination, and careful residual/Jacobian consistency. This is the proper way to do large-signal transistor models in audio.
+Thoughtful numerical robustness
+Smoothly tapered exponential (ex/exd) instead of a hard ceiling — prevents the classic “collector voltage flies above the rail / jagged clip tops” artefact.
+Junction voltage limiter with consistent derivatives.
+Input homotopy continuation when the Class-A stage switches regions (cutoff ↔ saturation).
+Multiple physical seed strategies (previous sample → intermediate inputs → quiescent / rail estimates).
+Finite-value guards so a single bad sample cannot poison the continuation state.
+
+Gain-knob behaviour is authentic
+The 40 dB-per-decade mapping and the fact that lowering the sensitivity increases drive into the Class-A stage is correct for the 1073.
+Clean architecture
+Header-only circuit model, reusable Newton solver and BJT model, stereo instances with independent state, simple JUCE processor wrapper.
+
+Weaknesses / areas for improvement
+
+Only the preamp section
+No EQ (high shelf, mid presence, low shelf, HPF). The classic 1073 character is heavily EQ + preamp. This is currently a pure preamp/saturation module.
+Simplified output stage
+The push-pull model is a reduced exponential pair, not a full Ebers-Moll + bias-spreader network. It works, but the crossover and soft-clip behaviour will not be as nuanced as a more complete BA283 model.
+Transformer modelling is minimal
+Just a fixed ratio + one-pole HP/LP. Real LO1166 / output transformers have frequency-dependent turns ratio, leakage inductance, core saturation, hysteresis, and winding resistance. These contribute a lot of the “iron” character.
+No junction capacitances / frequency-dependent β
+Purely algebraic (memory only in the external one-pole filters). Fine for the audio band at moderate drive, but high-frequency distortion products and transient behaviour will be less accurate.
+Parameter values are hand-tuned approximations
+Bias points, Is, beta, resistor values, etc. look plausible but are not taken from a measured golden unit or original schematic with exact component tolerances. The auto-calibration helps level matching but does not guarantee harmonic spectrum matching.
+CPU cost
+Two Newton solves per sample (3-node + 2-node) with up to 64 iterations and line-search is not cheap. Fine for offline / a couple of instances, but you will feel it in a dense mix. No SIMD or multi-rate optimisations yet.
+Missing features that users expect
+Polarity invert
+Output trim / fader
+True 5 dB stepped gain (current control is continuous)
+Phantom / DI / line options
+Any form of EQ
+
+
+Overall assessment
+This is high-quality research-grade work. The numerical care (especially the tapered exp, consistent limiters, and homotopy) shows the author has already fought and fixed the classic pitfalls of nonlinear circuit models in real-time audio. It is far above typical “soft-clip + filter” 1073 clones.
+It is still an early / incomplete 1073: preamp-only, simplified transformers and output stage, no EQ. As a foundation for a serious physical-model plugin it is excellent. The next high-value steps would be:
+
+Full inductor-based EQ section (or at least a good approximation of the presence band).
+Better transformer models (even simple nonlinear inductance + hysteresis would help a lot).
+Measured golden-unit calibration of the operating points and harmonic signature.
+CPU optimisations (pre-computed tables, reduced iteration counts once the state is warm, etc.).

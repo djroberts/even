@@ -28,8 +28,29 @@ public:
     static Result solve (const Residual& residual, const Jacobian& jacobian,
                          Vec& x, int maxIterations = 16, double tol = 1e-10)
     {
+        // Two-callback form: residual and Jacobian evaluated separately. Kept
+        // for compatibility; solveCombined below is preferred in hot paths
+        // because it evaluates residual + Jacobian in a single pass.
+        auto evaluate = [&] (const Vec& xv, Vec& F, Mat& J)
+        {
+            residual (xv, F);
+            jacobian (xv, J);
+        };
+        return solveCombined (evaluate, residual, x, maxIterations, tol);
+    }
+
+    // Combined form: `evaluate` fills the residual AND the Jacobian at the
+    // same iterate, so shared transcendental work (BjtModel junction
+    // exponentials etc.) is computed once instead of twice per Newton
+    // iteration. `residualOnly` is used for line-search candidates, where no
+    // Jacobian is needed. Numerically identical to the two-callback solve.
+    template <typename Evaluate, typename Residual>
+    static Result solveCombined (const Evaluate& evaluate, const Residual& residual,
+                                 Vec& x, int maxIterations = 16, double tol = 1e-10)
+    {
         Result r;
         Vec F {}, xNew {}, FNew {}, dx {};
+        Mat J {};
 
         // A wild Newton step (or a poisoned seed) can overflow the device
         // exponentials to inf, which propagates NaN through the residual.
@@ -42,7 +63,7 @@ public:
 
         for (int iter = 0; iter < maxIterations; ++iter)
         {
-            residual (x, F);
+            evaluate (x, F, J); // residual + Jacobian in one pass
             if (! finite (F))
                 return r; // unconverged; caller falls back to a physical seed
             r.residualNorm = norm (F);
@@ -54,15 +75,12 @@ public:
                 return r;
             }
 
-            Mat J {};
-            jacobian (x, J);
-
             if (! solveLinear (J, F, dx))
                 return r; // singular Jacobian, keep last x
 
             bool improved = false;
             double lambda = 1.0;
-            for (int ls = 0; ls < 14; ++ls)
+            for (int ls = 0; ls < 8; ++ls)
             {
                 for (int i = 0; i < N; ++i)
                     xNew[i] = x[i] - lambda * dx[i];
