@@ -56,7 +56,10 @@ void Neve1073AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 void Neve1073AudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     juce::MemoryInputStream mis (data, (size_t) sizeInBytes, false);
-    gainParam.setValueNotifyingHost (mis.readFloat());
+    // The chunk stores the plain dB value; setValueNotifyingHost expects a
+    // normalised 0..1 value. (Writing the raw dB value here used to slam the
+    // knob to -80 dB whenever the host restored the session.)
+    gainParam.setValueNotifyingHost (gainParam.convertTo0to1 (mis.readFloat()));
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

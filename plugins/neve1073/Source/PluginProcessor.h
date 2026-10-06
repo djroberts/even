@@ -32,9 +32,12 @@ public:
 
     // Gain: maps to the 1073 sensitivity/attenuator network (amount of drive
     // into the BA283 saturation stage). Range -80..+10 as on the hardware.
+    // Plain linear mapping, 0.01 dB resolution (2 decimals). Fully
+    // counterclockwise = +10 dB, fully clockwise = -80 dB (knob is inverted
+    // on the faceplate; the underlying value mapping is unchanged).
     juce::AudioParameterFloat gainParam {
         "gain", "Gain",
-        juce::NormalisableRange<float> { -80.0f, 10.0f, 0.1f, 2.5f },
+        juce::NormalisableRange<float> { -80.0f, 10.0f, 0.01f },
         0.0f
     };
 
