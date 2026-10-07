@@ -31,3 +31,4 @@ add_subdirectory(common)
 
 # ---- Plugins ----
 add_subdirectory(neve1073)
+add_subdirectory(neve1073eq)
