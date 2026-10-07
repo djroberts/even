@@ -87,7 +87,6 @@ Neve1073AudioProcessorEditor::Neve1073AudioProcessorEditor (Neve1073AudioProcess
     : AudioProcessorEditor (p),
       processorRef (p),
       gainAttachment (p.gainParam, gainKnob),
-      engineAttachment (p.qualityParam, engineBox),
       oversampleAttachment (p.oversampleParam, oversampleButton)
 {
     setLookAndFeel (&lookAndFeel);
@@ -125,26 +124,9 @@ Neve1073AudioProcessorEditor::Neve1073AudioProcessorEditor (Neve1073AudioProcess
     gainLabel.setFont (juce::FontOptions (13.0f, juce::Font::bold));
     addAndMakeVisible (gainLabel);
 
-    // Engine dropdown, styled to sit on the faceplate like a console switch.
-    // The attachment (built above, in the initializer list) maps parameter
-    // choice index -> combo item id (index + 1) but does NOT create items,
-    // so populate it here and re-sync to the parameter's current choice.
-    engineBox.clear (juce::dontSendNotification);
-    engineBox.addItem ("Exact", 1);
-    engineBox.addItem ("Fast", 2);
-    engineAttachment.sendInitialUpdate();
-    engineBox.setJustificationType (juce::Justification::centred);
-    engineBox.setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff2a2c2e));
-    engineBox.setColour (juce::ComboBox::textColourId, juce::Colour (0xffd7dadd));
-    engineBox.setColour (juce::ComboBox::arrowColourId, juce::Colour (0xffb9bec3));
-    engineBox.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff2a2626));
-    engineBox.setTooltip ("Exact: table-seeded Newton (quality-neutral). "
-                          "Fast: pure table lookup (lowest CPU).");
-    addAndMakeVisible (engineBox);
-    engineLabel.setJustificationType (juce::Justification::centred);
-    engineLabel.setColour (juce::Label::textColourId, juce::Colour (0xffb9bec3));
-    engineLabel.setFont (juce::FontOptions (10.0f));
-    addAndMakeVisible (engineLabel);
+    // (The old ENGINE dropdown was removed: the plugin runs its verified
+    // table read unconditionally. The oversampling toggle now sits alone in
+    // the bottom strip, centred.)
 
     // Oversampling toggle, styled like the rest of the faceplate.
     oversampleButton.setButtonText ("2x OS");
@@ -204,11 +186,10 @@ void Neve1073AudioProcessorEditor::resized()
     gainKnob.setBounds (body.removeFromTop (body.getHeight() - 22 - 30).reduced (26));
     gainLabel.setBounds (body.removeFromTop (22));
 
-    // Control strip along the bottom of the faceplate: oversampling toggle
-    // on the left, engine dropdown on the right.
+    // Control strip along the bottom of the faceplate: oversampling toggle,
+    // centred now that the engine dropdown is gone.
     auto strip = body.removeFromTop (30).reduced (30, 5);
     oversampleButton.setBounds (strip.removeFromLeft (64).removeFromTop (20));
-    strip.removeFromLeft (8);
-    engineLabel.setBounds (strip.removeFromLeft (44));
-    engineBox.setBounds (strip.removeFromRight (strip.getWidth()).removeFromTop (20));
+    oversampleButton.setBounds (oversampleButton.getBounds()
+                                    .translated ((strip.getWidth() - 64) / 2, 0));
 }

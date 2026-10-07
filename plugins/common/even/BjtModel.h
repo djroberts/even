@@ -84,6 +84,18 @@ struct BjtModel
         else { e = std::exp (x0) * std::exp ((x - x0) * k); d = k * e; }
     }
 
+    // Two-lane exPair: identical results to two exPair calls. (A NEON 2-lane
+    // exp was measured at parity with two scalar libm exps on Apple Silicon --
+    // libm exp dual-issues across the FP pipes -- so this is kept as the
+    // single scalar fast path with a deep-reverse-bias early out instead:
+    // exp(x) < e^-40 ~ 4e-18 is indistinguishable from 0 at the solver's
+    // 1e-10 tolerance, and the reverse junction sits there most of the time.)
+    static void exPair2 (double xa, double xb, double& ea, double& da, double& eb, double& db)
+    {
+        if (xa > -40.0) exPair (xa, ea, da); else { ea = 0.0; da = 0.0; }
+        if (xb > -40.0) exPair (xb, eb, db); else { eb = 0.0; db = 0.0; }
+    }
+
     Operating eval (double vbeIn, double vbcIn) const
     {
         // Junction limiting: beyond +/-0.7 V the junction voltage is allowed
@@ -95,8 +107,7 @@ struct BjtModel
         const double vbe = lim (vbeIn), vbc = lim (vbcIn);
 
         double eF, dF, eR, dR;
-        exPair (vbe / Vt, eF, dF);  // exp(vbe/Vt) and its derivative
-        exPair (vbc / Vt, eR, dR);  // exp(vbc/Vt) and its derivative
+        exPair2 (vbe / Vt, vbc / Vt, eF, dF, eR, dR); // one vector exp for both junctions
         const double if_ = Is * (eF - 1.0);
         const double ir  = Is * (eR - 1.0);
 

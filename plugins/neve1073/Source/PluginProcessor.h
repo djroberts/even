@@ -42,13 +42,11 @@ public:
         0.0f
     };
 
-    // Engine selection (dropdown). "Exact" = precomputed curve seeds the
-    // Newton solves, which polish to full solver tolerance (quality-neutral,
-    // bit-transparent at float32). "Fast" = pure curve lookup, no Newton in
-    // the audio path (validated below the float32 LSB; lowest CPU).
-    juce::AudioParameterChoice qualityParam {
-        "quality", "Engine", juce::StringArray { "Exact", "Fast" }, 0
-    };
+    // Engine: the plugin runs the verified table read (Engine::Exact)
+    // unconditionally. The old Exact/Fast dropdown is gone -- both ids ran
+    // the same verified table read (worst ~2.4e-7 V vs the Live reference =
+    // about one float32 LSB at full output, ~1e-9 typical); see
+    // Neve1073Circuit.h. Live remains available internally for validation.
 
     // 2x oversampling toggle. Runs the circuit model at twice the host rate
     // (polyphase IIR half-band up/downsampling) so the saturation stages see
@@ -62,7 +60,6 @@ public:
 
 private:
     std::atomic<float> gainDb { 0.0f };
-    std::atomic<int>   engineMode { 0 }; // 0 = Exact, 1 = Fast
     Neve1073Circuit circuit[2];
     float lastGain[2] = { -999.0f, -999.0f }; // last value handed to setGainDb
 

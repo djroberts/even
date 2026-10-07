@@ -26,12 +26,9 @@ void Neve1073AudioProcessor::applyOversampling (bool on)
     oversamplingActive = on;
     const double fs = hostSampleRate * (on ? 2.0 : 1.0);
 
-    const auto e = engineMode.load() == 1 ? Neve1073Circuit::Engine::Fast
-                                          : Neve1073Circuit::Engine::Exact;
     for (auto& c : circuit)
     {
-        c.prepare (fs);
-        c.setEngine (e);
+        c.prepare (fs);   // circuits run Engine::Exact (verified table read)
         c.setGainDb (gainParam.get());
     }
     lastGain[0] = lastGain[1] = gainParam.get();
@@ -69,14 +66,8 @@ void Neve1073AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     if (wantOs != oversamplingActive)
         applyOversampling (wantOs);
 
-    // Engine selection, cached so the circuit is only poked when it changed.
-    const int engine = (int) qualityParam.getIndex();
-    if (engine != engineMode.exchange (engine))
-    {
-        const auto e = engine == 1 ? Neve1073Circuit::Engine::Fast
-                                   : Neve1073Circuit::Engine::Exact;
-        for (auto& c : circuit) c.setEngine (e);
-    }
+    // (Engine selection removed: the plugin runs the verified table read
+    // unconditionally. The old Exact/Fast block was here.)
 
     const int numSamples = buffer.getNumSamples();
 
@@ -126,7 +117,11 @@ void Neve1073AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::MemoryOutputStream mos (destData, false);
     mos.writeFloat (gainParam.get());
-    mos.writeInt (qualityParam.getIndex());
+    // Legacy engine slot: kept in the chunk (written as 0) so old sessions
+    // (which stored gain float + engine int + os bool) still parse with the
+    // oversampling flag aligned. New sessions ignore it -- the table read
+    // runs regardless of what old sessions had selected.
+    mos.writeInt (0);
     mos.writeBool (oversampleParam.get());
 }
 
@@ -138,14 +133,11 @@ void Neve1073AudioProcessor::setStateInformation (const void* data, int sizeInBy
     // knob to -80 dB whenever the host restored the session.)
     gainParam.setValueNotifyingHost (gainParam.convertTo0to1 (mis.readFloat()));
 
-    // Engine index appended after the gain. Older sessions (pre-dropdown)
-    // have no bytes left; they keep the Exact default.
+    // Legacy engine index appended after the gain: skipped (not applied --
+    // the verified table read runs unconditionally). Older sessions
+    // (pre-dropdown) have no bytes left; nothing to skip.
     if (mis.getNumBytesRemaining() >= 4)
-    {
-        const int idx = juce::jlimit (0, qualityParam.choices.size() - 1, mis.readInt());
-        engineMode.store (idx);
-        qualityParam.setValueNotifyingHost (qualityParam.convertTo0to1 ((float) idx));
-    }
+        mis.readInt();
 
     // Oversampling flag appended last (one byte). Absent in older sessions:
     // keep the default (off).

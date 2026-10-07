@@ -35,11 +35,6 @@ private:
     juce::Label  gainLabel { {}, "GAIN" };
     juce::SliderParameterAttachment gainAttachment;
 
-    // Engine selection (Exact / Fast) shown as a small console dropdown.
-    juce::ComboBox engineBox;
-    juce::Label    engineLabel { {}, "ENGINE" };
-    juce::ComboBoxParameterAttachment engineAttachment;
-
     // 2x oversampling, shown as a small console toggle switch.
     juce::ToggleButton oversampleButton;
     juce::ButtonParameterAttachment oversampleAttachment;
