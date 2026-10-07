@@ -2,32 +2,23 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "PluginProcessor.h"
+#include "even/gui/EvenLookAndFeel.h"
+#include "even/gui/ConsoleFaceplate.h"
 
 //==============================================================================
-/** Vintage-console look matching the neve1073 preamp plugin: grey brushed
-    panel, dark rotary knobs with ivory pointers, hardware freq switches. */
-class Neve1073EqLookAndFeel : public juce::LookAndFeel_V4
-{
-public:
-    void drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h,
-                           float sliderPosProportional,
-                           const float rotaryStartAngle,
-                           const float rotaryEndAngle,
-                           juce::Slider&) override;
-};
-
-//==============================================================================
+/** Vintage-console look matching the neve1073 preamp plugin: brushed-steel
+    faceplate, dark rotary knobs with ivory pointers, hardware freq switches. */
 class Neve1073EqAudioProcessorEditor : public juce::AudioProcessorEditor
 {
 public:
     explicit Neve1073EqAudioProcessorEditor (Neve1073EqAudioProcessor&);
     ~Neve1073EqAudioProcessorEditor() override;
 
-    void paint (juce::Graphics&) override;
     void resized() override;
 
 private:
-    Neve1073EqLookAndFeel lookAndFeel;
+    even::gui::EvenLookAndFeel lookAndFeel { even::gui::EvenLookAndFeel::KnobStyle::Grey };
+    even::gui::ConsoleFaceplate faceplate { "NEVE", "1073 EQ" };
 
     // Faceplate: HF | MID 1 | MID 2 | LF columns; each mid has its own
     // 6-position frequency switch + boost/cut pot.
@@ -46,3 +37,4 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Neve1073EqAudioProcessorEditor)
 };
+
