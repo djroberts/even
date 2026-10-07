@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_dsp/juce_dsp.h>
 #include "Neve1073Circuit.h"
 
 //==============================================================================
@@ -49,11 +50,25 @@ public:
         "quality", "Engine", juce::StringArray { "Exact", "Fast" }, 0
     };
 
+    // 2x oversampling toggle. Runs the circuit model at twice the host rate
+    // (polyphase IIR half-band up/downsampling) so the saturation stages see
+    // less aliasing. Toggling re-prepares the circuits at the new rate; the
+    // transfer tables are rate-independent and shared, so this is cheap.
+    juce::AudioParameterBool oversampleParam {
+        "oversample", "2x Oversample", false
+    };
+
+    void applyOversampling (bool on);
+
 private:
     std::atomic<float> gainDb { 0.0f };
     std::atomic<int>   engineMode { 0 }; // 0 = Exact, 1 = Fast
     Neve1073Circuit circuit[2];
     float lastGain[2] = { -999.0f, -999.0f }; // last value handed to setGainDb
+
+    double hostSampleRate = 0.0;
+    bool   oversamplingActive = false;   // circuits currently run at 2x rate
+    std::unique_ptr<juce::dsp::Oversampling<float>> oversampling;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Neve1073AudioProcessor)
 };

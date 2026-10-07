@@ -54,6 +54,16 @@ public:
     {
         fs = sampleRate;
 
+        // Reset the homotopy continuation state BEFORE the DC solves and the
+        // calibration run below: prepare() may be called on a circuit that
+        // has already processed audio (e.g. the oversampling toggle swapping
+        // the model between 1x and 2x the host rate), and a stale `lastCeVin`
+        // from heavy drive steers the Live-solve homotopy during calibration
+        // to a different operating branch -- permanently mis-calibrating
+        // `normalization`. (The reset at the end of prepare only cleans up
+        // for playback; it happens too late for the calibration itself.)
+        lastCeVin = 0.0;
+
         // DC operating point of the Class-A stage (signal source at 0 V),
         // starting from a rough hand-computed bias estimate.
         dcSolution = { 2.9, 1.8, 13.0 };
@@ -142,6 +152,17 @@ public:
         // the trim so 0 dB sensitivity passes it at unity. Runs in Live mode
         // so calibration never depends on the (possibly not-yet-built) table
         // -- and so the calibration result is identical for every engine.
+        //
+        // The calibration MUST run at unity drive: prepare() may be called on
+        // a circuit that has already processed audio (e.g. the oversampling
+        // toggle re-preparing at 2x the host rate), and a leftover hot
+        // driveScale would make the calibration measure an overdriven peak,
+        // permanently mis-scaling `normalization` (observed: 0.079 -> 0.043
+        // after re-preparing while the knob sat at -40 dB). Save and restore
+        // the caller's gain around it.
+        const float savedDriveGain = driveGain;
+        driveGain = 1.0f;
+        driveScale = inputScale;
         normalization = 1.0;
         const Engine savedEngine = engine;
         engine = Engine::Live;
@@ -158,6 +179,8 @@ public:
                 normalization = amp / peak;
         }
         engine = savedEngine;
+        driveGain = savedDriveGain;
+        driveScale = (double) driveGain * inputScale;
 
         // The calibration run above exercises the real signal chain, which
         // drags the continuation states to wherever the last sine sample

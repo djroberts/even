@@ -87,7 +87,8 @@ Neve1073AudioProcessorEditor::Neve1073AudioProcessorEditor (Neve1073AudioProcess
     : AudioProcessorEditor (p),
       processorRef (p),
       gainAttachment (p.gainParam, gainKnob),
-      engineAttachment (p.qualityParam, engineBox)
+      engineAttachment (p.qualityParam, engineBox),
+      oversampleAttachment (p.oversampleParam, oversampleButton)
 {
     setLookAndFeel (&lookAndFeel);
 
@@ -145,6 +146,15 @@ Neve1073AudioProcessorEditor::Neve1073AudioProcessorEditor (Neve1073AudioProcess
     engineLabel.setFont (juce::FontOptions (10.0f));
     addAndMakeVisible (engineLabel);
 
+    // Oversampling toggle, styled like the rest of the faceplate.
+    oversampleButton.setButtonText ("2x OS");
+    oversampleButton.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffd7dadd));
+    oversampleButton.setColour (juce::ToggleButton::tickColourId, juce::Colour (0xffe0554a));
+    oversampleButton.setColour (juce::ToggleButton::tickDisabledColourId, juce::Colour (0xff565a5e));
+    oversampleButton.setTooltip ("Runs the circuit model at twice the sample rate "
+                                 "(less aliasing, higher CPU).");
+    addAndMakeVisible (oversampleButton);
+
     setSize (280, 258);
 }
 
@@ -194,8 +204,11 @@ void Neve1073AudioProcessorEditor::resized()
     gainKnob.setBounds (body.removeFromTop (body.getHeight() - 22 - 30).reduced (26));
     gainLabel.setBounds (body.removeFromTop (22));
 
-    // Engine dropdown strip along the bottom of the faceplate.
-    auto strip = body.removeFromTop (30).reduced (40, 5);
-    engineBox.setBounds (strip.removeFromRight (strip.getWidth() - 70).removeFromTop (20));
-    engineLabel.setBounds (strip);
+    // Control strip along the bottom of the faceplate: oversampling toggle
+    // on the left, engine dropdown on the right.
+    auto strip = body.removeFromTop (30).reduced (30, 5);
+    oversampleButton.setBounds (strip.removeFromLeft (64).removeFromTop (20));
+    strip.removeFromLeft (8);
+    engineLabel.setBounds (strip.removeFromLeft (44));
+    engineBox.setBounds (strip.removeFromRight (strip.getWidth()).removeFromTop (20));
 }

@@ -40,5 +40,9 @@ private:
     juce::Label    engineLabel { {}, "ENGINE" };
     juce::ComboBoxParameterAttachment engineAttachment;
 
+    // 2x oversampling, shown as a small console toggle switch.
+    juce::ToggleButton oversampleButton;
+    juce::ButtonParameterAttachment oversampleAttachment;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Neve1073AudioProcessorEditor)
 };
