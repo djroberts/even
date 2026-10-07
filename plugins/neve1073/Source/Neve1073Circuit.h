@@ -8,6 +8,7 @@
 #include <vector>
 #include <even/NewtonSolver.h>
 #include <even/BjtModel.h>
+#include <even/TransformerModel.h>
 
 //==============================================================================
 // Neve 1073 preamp circuit model.
@@ -97,12 +98,44 @@ public:
             micro = st.micro;
         }
 
-        // One-pole coefficients (transformer / coupling behaviour). These must
-        // be set BEFORE the calibration run below, which exercises the real
-        // signal chain (processSample depends on them).
-        inputHp  = pole (12.0, fs);    // input transformer LF roll-off
-        outputHp = pole (8.0, fs);     // output transformer / coupling cap
-        outputLp = pole (48000.0, fs); // gentle HF loss of the iron & silicon
+        // Transformer models. These must be prepared BEFORE the calibration
+        // run below, which exercises the real signal chain (processSample
+        // depends on them).
+        //
+        // Input: Marinair LO1166, 1:2 step-up. Winding + source resistance
+        // against the magnetizing inductance gives the ~12 Hz LF corner; the
+        // core knee is placed at the flux swing of a full-scale ~40 Hz signal
+        // so hot low end saturates the iron while mids stay clean.
+        even::TransformerModel::Params pin;
+        pin.ratio = 2.0;      // 1:2 step-up
+        pin.rw    = 1200.0;   // source + primary winding resistance
+        pin.lm    = 16.0;     // 1200 / (2*pi*12 Hz) -> ~12 Hz LF corner
+        pin.leak  = 0.012;    // ~134 kHz HF corner against the ~10k input
+        pin.rs2   = 40.0;
+        pin.rload = 10000.0;  // sensitivity network input impedance
+        pin.cc    = 4.7e-5;   // ~3 Hz DC block
+        pin.imSat = 1.0e-3;
+        pin.lamK  = 8.0e-3;   // full-scale 40 Hz flux swing
+        pin.hystK = 0.35;     // hysteresis loop widening
+        inTf.setParams (pin);
+        inTf.prepare (fs);
+
+        // Output: BA283 output iron. Winding resistance against Lm gives the
+        // ~8 Hz LF corner the old HP one-pole approximated; leakage against
+        // the 600 ohm load gives the ~48 kHz HF corner of the old LP.
+        even::TransformerModel::Params pout;
+        pout.ratio = 1.0;
+        pout.rw    = 100.0;   // 100 / (2*pi*8 Hz) -> ~8 Hz LF corner
+        pout.lm    = 2.0;
+        pout.leak  = 1.2e-3;  // ~85 kHz HF corner against the 640 ohm loop
+        pout.rs2   = 40.0;
+        pout.rload = 600.0;   // reflected load
+        pout.cc    = 6.8e-4;  // ~2 Hz DC block
+        pout.imSat = 2.5e-3;
+        pout.lamK  = 2.5e-2;  // full-scale 40 Hz flux swing
+        pout.hystK = 0.35;
+        outTf.setParams (pout);
+        outTf.prepare (fs);
 
         // Calibrate normalization by running the real chain: with unity
         // normalization, measure the output for a -12 dBFS-ish sine and set
@@ -133,7 +166,8 @@ public:
         dcSolution = ceDc;
         ppDc = ppDcQuiescent;
         lastCeVin = 0.0;
-        inputHpZ = outputHpZ = outputLpZ = 0.0;
+        inTf.reset();
+        outTf.reset();
     }
 
     // Debug hook (harness only): current DC operating point and calibration.
@@ -190,21 +224,20 @@ public:
 
     float processSample (float in)
     {
-        // --- Input transformer: step-up + LF pole (state-variable form) ---
-        const double x = (double) in * transformerRatio;
+        // --- Input transformer: step-up + physical coupling (state model) ---
+        const double x = inTf.process ((double) in);
 
-        // Digital-silence fast path: once the transformer state has decayed
+        // Digital-silence fast path: once the transformer states have decayed
         // to nothing, a silent input is the DC operating point exactly -- no
-        // Newton solves needed, the one-poles stay at zero.
-        if (x == 0.0 && std::abs (inputHpZ) < 1.0e-15)
+        // Newton solves needed, the transformer states stay at zero.
+        if (x == 0.0 && inTf.quiet() && outTf.quiet())
         {
-            inputHpZ = outputHpZ = outputLpZ = 0.0;
+            inTf.reset();
+            outTf.reset();
             return 0.0f;
         }
 
-        inputHpZ = inputHp * inputHpZ + (1.0 - inputHp) * x;
-        const double xf = x - inputHpZ;                       // AC-coupled
-        const double drive = xf * driveScale;
+        const double drive = x * driveScale;
 #ifdef NEVE_TABLE_DEBUG
         lastDrive = drive; // harness observability; not in the plugin build
 #endif
@@ -238,12 +271,8 @@ public:
             }
         }
 
-        // --- Output transformer: remove DC, shape band ---
-        outputHpZ = outputHp * outputHpZ + (1.0 - outputHp) * y;
-        y = y - outputHpZ;
-        outputLpZ = outputLp * outputLpZ + (1.0 - outputLp) * y;
-
-        return (float) (outputLpZ * normalization * outputTrim);
+        // --- Output transformer: physical coupling, removes DC itself ---
+        return (float) (outTf.process (y) * normalization * outputTrim);
     }
 
     // Validation/benchmark hook: Live-engine output through the same filter
@@ -251,14 +280,9 @@ public:
     // circuit instance (it advances the filter state).
     float processSampleLive (float in)
     {
-        const double x = (double) in * transformerRatio;
-        inputHpZ = inputHp * inputHpZ + (1.0 - inputHp) * x;
-        const double drive = (x - inputHpZ) * driveScale;
+        const double drive = inTf.process ((double) in) * driveScale;
         double y = solveOutput (drive);
-        outputHpZ = outputHp * outputHpZ + (1.0 - outputHp) * y;
-        y = y - outputHpZ;
-        outputLpZ = outputLp * outputLpZ + (1.0 - outputLp) * y;
-        return (float) (outputLpZ * normalization * outputTrim);
+        return (float) (outTf.process (y) * normalization * outputTrim);
     }
 
 private:
@@ -596,6 +620,8 @@ public:
     //==========================================================================
 
     static constexpr double transformerRatio = 2.0;  // LO1166, 1:2 step-up
+                                                     // (now modelled inside
+                                                     // even::TransformerModel)
     static constexpr double inputScale       = 2.5;  // attenuator + drive in
     static constexpr double outputTrim       = 1.0;
 
@@ -1040,16 +1066,16 @@ public:
     }
 
     //==========================================================================
-    static double pole (double hz, double fs) { return std::exp (-2.0 * 3.14159265358979 * hz / fs); }
+    static double pole (double hz, double fs) { return std::exp (-2.0 * 3.14159265358979 * hz / fs); } // (retired with the one-pole chain)
 
     double fs = 48000.0;
     float  driveGain = 1.0f;
     double driveScale = inputScale; // driveGain * inputScale, set by setGainDb
 
-    double inputHp = 0.0, inputHpZ = 0.0;
-    double outputHp = 0.0, outputHpZ = 0.0;
-    double outputLp = 0.0, outputLpZ = 0.0;
     double normalization = 1.0;
+
+    // Physical transformer models (input LO1166 / output BA283 iron).
+    even::TransformerModel inTf, outTf;
 
     even::NewtonSolver<3>::Vec dcSolution {};
     even::NewtonSolver<3>::Vec ceDc {};         // quiescent fallback seed

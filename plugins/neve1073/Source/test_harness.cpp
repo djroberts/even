@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 #include <vector>
 #include "Neve1073Circuit.h"
 
@@ -119,6 +120,127 @@ int main()
 
         printf ("harmonics @ amp=%.2f (gain -20): 2f=%6.1f  3f=%6.1f  4f=%6.1f  5f=%6.1f dB\n",
                 amp, mag (2), mag (3), mag (4), mag (5));
+    }
+
+    //==========================================================================
+    // Transformer-model validation.
+    //
+    // 1. Small-signal frequency response: the linear part of the transformer
+    //    models must show the intended LF corners (~12 Hz input, ~8 Hz output)
+    //    and gentle HF loss, measured relative to a 1 kHz reference.
+    {
+        printf ("\nfrequency response (small signal, 0 dB gain, relative to 1 kHz):\n");
+        const double freqs[] = { 20.0, 40.0, 100.0, 1000.0, 10000.0, 20000.0 };
+        std::vector<double> mags;
+        double ref = 0.0;
+        for (double f : freqs)
+        {
+            Neve1073Circuit c;
+            c.prepare (fs);
+            c.setGainDb (0.0f);
+            const int n = (int) fs;
+            std::vector<float> buf ((size_t) n);
+            for (int i = 0; i < n; ++i)
+                buf[(size_t) i] = c.processSample ((float) (0.01 * std::sin (2.0 * 3.14159265358979 * f * i / fs)));
+            double re = 0.0, im = 0.0;
+            const int start = n / 2;
+            for (int i = start; i < n; ++i)
+            {
+                const double ph = 2.0 * 3.14159265358979 * f * i / fs;
+                re += buf[(size_t) i] * std::cos (ph);
+                im -= buf[(size_t) i] * std::sin (ph);
+            }
+            const double m = 2.0 * std::sqrt (re * re + im * im) / (n - start);
+            mags.push_back (m);
+            if (f == 1000.0) ref = m;
+        }
+        for (size_t k = 0; k < mags.size(); ++k)
+            printf ("  %8.1f Hz: %7.3f dB\n", freqs[k],
+                    20.0 * std::log10 (std::max (mags[k] / ref, 1e-12)));
+    }
+
+    // 2. Core saturation vs frequency: at matched drive the low frequencies
+    //    must distort MORE (flux ~ V/f): 2nd/3rd harmonic at 40 Hz should sit
+    //    well above the 440 Hz numbers from the sweep above.
+    {
+        Neve1073Circuit c;
+        c.prepare (fs);
+        c.setGainDb (0.0f);
+        const double f = 40.0, amp = 0.5;
+        const int n = (int) fs;
+        std::vector<float> buf ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            buf[(size_t) i] = c.processSample ((float) (amp * std::sin (2.0 * 3.14159265358979 * f * i / fs)));
+        auto mag = [&] (int harm)
+        {
+            double re = 0.0, im = 0.0;
+            const int start = n / 2;
+            for (int i = start; i < n; ++i)
+            {
+                const double ph = 2.0 * 3.14159265358979 * harm * f * i / fs;
+                re += buf[(size_t) i] * std::cos (ph);
+                im -= buf[(size_t) i] * std::sin (ph);
+            }
+            const double m = 2.0 * std::sqrt (re * re + im * im) / (n - start);
+            return 20.0 * std::log10 (std::max (m, 1e-9));
+        };
+        printf ("\n40 Hz core-saturation check (amp=%.2f, gain 0): 2f=%6.1f  3f=%6.1f dB (expect above the 440 Hz values)\n",
+                amp, mag (2), mag (3));
+    }
+
+    // 3. DC / drift guard: after a loud burst, 2 s of silence must decay the
+    //    transformer states (flux through the winding resistance, cap through
+    //    the source impedance) back to digital silence. The first ~0.5 s is
+    //    the legitimate relaxation transient; after that nothing may remain.
+    {
+        Neve1073Circuit c;
+        c.prepare (fs);
+        c.setGainDb (0.0f);
+        for (int i = 0; i < (int) (fs * 0.1); ++i)
+            c.processSample (i % 2 == 0 ? 1.0f : -1.0f);
+        double worst = 0.0;
+        for (int i = 0; i < (int) (fs * 2.0); ++i)
+        {
+            const double y = std::abs ((double) c.processSample (0.0f));
+            if (i > (int) (fs * 0.5))
+                worst = std::max (worst, y);
+        }
+        printf ("\nsilence-decay check: worst residual after 0.5 s = %.3e (expect < 1e-5)\n", worst);
+    }
+
+    // 4. Engine equivalence: Fast must track Live through the transformers to
+    //    better than the float32 LSB at typical levels.
+    {
+        Neve1073Circuit live, fast;
+        live.prepare (fs); fast.prepare (fs);
+        live.setEngine (Neve1073Circuit::Engine::Live);
+        fast.setEngine (Neve1073Circuit::Engine::Fast);
+        double worst = 0.0;
+        for (int i = 0; i < (int) fs; ++i)
+        {
+            const float x = (float) (0.8 * std::sin (2.0 * 3.14159265358979 * 997.0 * i / fs));
+            const double a = live.processSample (x);
+            const double b = fast.processSample (x);
+            worst = std::max (worst, std::abs (a - b));
+        }
+        printf ("engine check: worst |Fast - Live| = %.3e (expect < 6e-8)\n", worst);
+    }
+
+    // 5. CPU benchmark: 10 s of audio through the Fast engine, single
+    //    channel, reported as multiple-of-realtime.
+    {
+        Neve1073Circuit c;
+        c.prepare (fs);
+        c.setGainDb (0.0f);
+        c.setEngine (Neve1073Circuit::Engine::Fast);
+        const int n = (int) (fs * 10.0);
+        std::vector<float> buf ((size_t) n, 0.0f);
+        for (int i = 0; i < n; ++i)
+            buf[(size_t) i] = (float) (0.5 * std::sin (2.0 * 3.14159265358979 * 440.0 * i / fs));
+        const auto t0 = std::chrono::steady_clock::now();
+        c.process (buf.data(), n);
+        const double secs = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+        printf ("cpu benchmark (Fast, 1 ch): %.2f s for 10 s audio -> %.0fx realtime\n", secs, 10.0 / secs);
     }
     return 0;
 }
