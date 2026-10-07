@@ -14,12 +14,23 @@ namespace even
 //
 // Exponentials are clamped to exp(30) for numerical safety under Newton
 // over-shoot; the damped line search in NewtonSolver recovers from clamps.
+//
+// Optional reverse-junction current cap (irCap > 0): the raw model lets the
+// base->collector reverse current grow without bound in deep saturation,
+// which in a stage whose collector load can only SOURCE current produces the
+// classic "fold-back" artifact -- the collector is dragged back up toward the
+// base and the transfer curve reverses direction instead of clipping (heard
+// as a double-dip "W" on one half of the waveform). Capping ir with a smooth
+// rational saturator (C1 everywhere, analytic derivative included) makes
+// deep saturation bottom out at a finite reverse current: the stage clips
+// flat instead of folding. irCap = 0 (default) keeps the raw model.
 struct BjtModel
 {
     double Is    = 1.0e-15;   // saturation current [A]
     double betaF = 300.0;     // forward current gain
     double betaR = 4.0;       // reverse current gain
     double Vt    = 0.025852;  // thermal voltage @ ~27C
+    double irCap = 0.0;       // reverse-current cap [A]; 0 = uncapped
 
     struct Operating
     {
@@ -88,14 +99,27 @@ struct BjtModel
         exPair (vbc / Vt, eR, dR);  // exp(vbc/Vt) and its derivative
         const double if_ = Is * (eF - 1.0);
         const double ir  = Is * (eR - 1.0);
+
+        // Smooth reverse-current cap: irEff = irCap*ir/(irCap+ir) tends to
+        // irCap for ir >> irCap and to ir (slope 1) for ir << irCap, so the
+        // cap engages C1-continuously exactly where saturation begins.
+        // The Jacobian uses the same rational slope, keeping Newton exact.
+        double irEff = ir, capSlope = 1.0;
+        if (irCap > 0.0 && ir > 0.0)
+        {
+            const double s = irCap / (irCap + ir);
+            irEff = irCap * s * (ir / irCap); // = irCap*ir/(irCap+ir)
+            capSlope = s * s;
+        }
+
         // Consistent derivatives: d(e)/dv uses the tapered-slope form so the
         // Jacobian matches the residual even deep in the saturation tail.
-        const double gF  = Is / Vt * dF;  // d(exp)/dv
-        const double gR  = Is / Vt * dR;
+        const double gF  = Is / Vt * dF;          // d(exp)/dv
+        const double gR  = Is / Vt * dR * capSlope;
 
         Operating op;
-        op.ic = if_ - ir - ir / betaR;
-        op.ib = if_ / betaF + ir / betaR;
+        op.ic = if_ - irEff - irEff / betaR;
+        op.ib = if_ / betaF + irEff / betaR;
 
         op.dic_dvbe = gF * limd (vbeIn);
         op.dic_dvbc = -gR * (1.0 + 1.0 / betaR) * limd (vbcIn);

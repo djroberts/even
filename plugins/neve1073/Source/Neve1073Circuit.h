@@ -148,7 +148,7 @@ public:
     struct TableProbe { double tableVo, liveVo; };
     TableProbe probeTable (double drive)
     {
-        const double tableVo = evalTableVo (drive) - ppQuiescentVo;
+        const double tableVo = shapeCurve (drive, evalTableVo (drive) - ppQuiescentVo);
         const double live = solveOutput (drive);
         return { tableVo, live };
     }
@@ -215,7 +215,7 @@ public:
         {
             case Engine::Fast:
             {
-                y = evalTableVo (drive) - ppQuiescentVo;
+                y = shapeCurve (drive, evalTableVo (drive) - ppQuiescentVo);
                 break;
             }
             case Engine::Exact:
@@ -228,7 +228,7 @@ public:
                 even::NewtonSolver<4>::Vec ppSeed { tp.pb, tp.pe, tp.pc, tp.vo };
                 const auto op = ceSolve (drive, ceSeed);
                 const auto out = ppSolve (op.vc - ppInRef, ppSeed);
-                y = out.o - ppQuiescentVo;
+                y = shapeCurve (drive, out.o - ppQuiescentVo);
                 break;
             }
             case Engine::Live: // original per-sample solves
@@ -268,7 +268,36 @@ private:
     {
         const auto op = ceSolve (drive, dcSolution);
         const auto out = ppSolve (op.vc - ppInRef, ppDc);
-        return out.o - ppQuiescentVo;
+        return shapeCurve (drive, out.o - ppQuiescentVo);
+    }
+
+    //==========================================================================
+    // Clip envelope.
+    //
+    // Past its saturation point the composed curve does not clip -- it
+    // FOLDS. When the driver saturates, its emitter follows the base and
+    // (with the Vce floor above) the collector rides just above the emitter,
+    // so the whole output stage slides back UP as drive keeps growing: the
+    // negative branch reaches its minimum at drive ~ -1.45 and then reverses
+    // toward -1.9 (the "double-dip W" on a scope). A symmetric slide happens
+    // on the positive side past drive ~ +14 (the Class-A stage drifting out
+    // of its own saturation). A real amp absorbs overdrive at the clip
+    // level instead of folding, and the natural slope at both extremes is
+    // ~0, so holding the curve at its measured extreme beyond the fold
+    // onset joins C1 and is exactly the "clip flat" behaviour of the real
+    // stage. Applied to the composed curve at the engine output points
+    // (solveOutput / Exact path / Fast table read); table STORAGE stays raw
+    // so the residual-verified repair pass still sees true roots.
+    static constexpr double clipNegDrive = -1.344;
+    static constexpr double clipNegLevel = -5.6463;
+    static constexpr double clipPosDrive = 11.96;
+    static constexpr double clipPosLevel =  6.9816;
+
+    static double shapeCurve (double drive, double y)
+    {
+        if (drive < clipNegDrive) return clipNegLevel;
+        if (drive > clipPosDrive) return clipPosLevel;
+        return y;
     }
 
     //==========================================================================
@@ -779,15 +808,22 @@ public:
         double vcc = 24.0;     // positive rail (driver collector load)
         double rs   = 600.0;   // drive source impedance
         double rb1  = 33.0e3;  // vcc -> driver base
-        double rb2  = 16.2e3;  // driver base -> gnd. Divider + reD set the
-                               // driver's idle: ve ~ 2.9 mA * reD ~ 7 V, so
-                               // vth sits at ~7.9 V (was a low-voltage divider
-                               // with reD = 270; the heavier degeneration is
-                               // what keeps the driver's voltage gain near
-                               // unity so the output stage saturates over the
-                               // intended drive range instead of slamming its
-                               // rails at drive ~0.35).
-        double vth  = 24.0 * 16.2e3 / (33.0e3 + 16.2e3); // divider Thevenin
+        double rb2  = 12.1e3;  // driver base -> gnd. Divider + reD set the
+                               // driver's idle. reD = 2.4k sets the idle
+                               // current (~2.5 mA => ve ~ 6.0 V); the divider
+                               // Thevenin (~6.44 V) idles the collector
+                               // deliberately slightly below the midpoint of
+                               // its swing, giving the single-supply stage its
+                               // mild hardware-style asymmetry (clip levels
+                               // ~ -5.6 / +6.9, ratio ~1.2:1) and the touch
+                               // of even-order harmonic that is part of the
+                               // 1073 character. (The original 16.2k put vth
+                               // at 7.9 V: only +2.2 V of drive headroom
+                               // before driver saturation versus 7.9 V to
+                               // cutoff -- the negative half clipped (and
+                               // then folded) at less than half the level of
+                               // the positive half.)
+        double vth  = 24.0 * 12.1e3 / (33.0e3 + 12.1e3); // divider Thevenin
         double reD  = 2.4e3;   // driver emitter degeneration
         double rcD  = 3.6e3;   // driver collector load
         double rf   = 4.7e3;   // global feedback, output -> driver BASE.
@@ -817,7 +853,18 @@ public:
         double IsP  = 2.0e-6;  // power-device scaled saturation current
         double beta = 100.0;   // output device beta
         double Vt   = 0.025852;
-        even::BjtModel drv { 3.5e-14, 100.0, 4.0, 0.025852 }; // driver BJT
+        // even::BjtModel drv: driver BJT. The 5th initializer is the
+        // reverse-junction current cap (BjtModel::irCap): without it, deep
+        // driver saturation lets the base->collector current grow unbounded,
+        // dragging the collector (and with it the output) back UP -- the
+        // transfer curve fold-back that made the negative half of the
+        // waveform reverse (double-dip "W") and engage at a fraction of the
+        // positive half's level. Capped, the driver bottoms out and the
+        // stage clips flat. The cap sits a little above the stage's max
+        // legitimate conduction (vcc/rcD ~ 6.7 mA) so normal saturation
+        // still behaves physically; only the pathological deep-saturation
+        // region is limited.
+        even::BjtModel drv { 3.5e-14, 100.0, 4.0, 0.025852, 8.0e-3 };
     } pp;
 
     static void ppResidual (const PushPullStage& s, double vin,
@@ -899,6 +946,26 @@ public:
         // Driver collector: load from the supply, collector current, and the
         // pair's base current drawn through the spreader.
         F[2] = (vc - s.vcc) / s.rcD + op.ic + iSum * gb;
+
+        // Collector saturation floor. A real BJT's collector cannot sink
+        // below its emitter (Vce bottoms at Vce_sat ~ 0.2 V: the internal
+        // base->collector junction conducts hard and clamps the collector to
+        // the emitter). The junction limiter's 0.08-slope tail suppresses
+        // exactly that conduction, which admits nonphysical roots in deep
+        // saturation where the collector sits BELOW the emitter and then
+        // tracks the base upward as drive grows -- the transfer-curve
+        // fold-back that reversed one half of the waveform (the double-dip
+        // "W"). This term re-clamps the collector smoothly: current injected
+        // into the collector node grows smoothly once vc tries to fall below
+        // ve + vceSat. C1 everywhere (soft-abs), Jacobian consistent.
+        const double vceSat = 0.25;
+        const double over   = (ve + vceSat) - vc;   // > 0 below the floor
+        const double w      = 0.03;                 // soft-knee width [V]
+        const double root   = std::sqrt (over * over + w * w);
+        const double sSat   = 0.5 * (over + root);  // smooth max(0, over)
+        const double dsd    = 0.5 * (1.0 + over / root);
+        constexpr double kSat = 0.08;               // clamp conductance [S]
+        F[2] -= kSat * sSat;
         // Output node: device current must feed load + feedback.
         F[3] = -iSum + vo / s.rl + (vo - s.nfbRef - vb) / s.rf;
 
@@ -923,8 +990,8 @@ public:
         j[1][1] = 1.0 / s.reD + icB + ibB;
         j[1][2] = icC + ibC;
         j[2][0] = icB + icC;
-        j[2][1] = -icB;
-        j[2][2] = 1.0 / s.rcD - icC + g * gb;
+        j[2][1] = -icB - kSat * dsd;
+        j[2][2] = 1.0 / s.rcD - icC + g * gb + kSat * dsd;
         j[2][3] = -g * gb;
         j[3][0] = -1.0 / s.rf;
         j[3][2] = -g;
