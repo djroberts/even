@@ -57,8 +57,8 @@ int main()
         Neve1073Circuit c;
         c.prepare (fs);
         const auto d = c.debugState();
-        printf ("ceDc = vb=%.4f ve=%.4f vc=%.4f | ppDc = vd=%.4f vo=%.4f | norm=%.6f\n",
-                d.vb, d.ve, d.vc, d.vd, d.vo, d.norm);
+        printf ("ceDc = vb=%.4f ve=%.4f vc=%.4f | ppDc = b=%.4f e=%.4f c=%.4f vo=%.4f | norm=%.6f\n",
+                d.vb, d.ve, d.vc, d.pb, d.pe, d.pc, d.po, d.norm);
     }
 
     {

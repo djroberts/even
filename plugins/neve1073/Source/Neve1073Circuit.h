@@ -18,9 +18,10 @@
 //     -> sensitivity/attenuator network (the gain knob)
 //     -> Class-A common-emitter voltage amplifier (BA215/BA284 style, self-
 //        biased through a divider, emitter degenerated)  [3-node MNA + Newton]
-//     -> BA283 output amplifier: Class-AB complementary emitter-follower pair
-//        (BC184L NPN / BC214L PNP) with ~2*Vbe bias spreader, local feedback,
-//        driving the output transformer  [2-node MNA + Newton]
+//     -> BA283 output amplifier: driver stage + Class-AB complementary
+//        emitter-follower pair (BC184L NPN / BC214L PNP) with ~2*Vbe bias
+//        spreader and global feedback from the output into the driver
+//        emitter  [4-node MNA + Newton]
 //
 // Junction capacitances are folded out (audio-band algebraic model); coupling
 // and transformer behaviour are handled by the surrounding one-pole filters,
@@ -29,7 +30,7 @@ class Neve1073Circuit
 {
 public:
     struct CeResult { double vb, ve, vc; };
-    struct PpState  { double vd, vo; };
+    struct PpState  { double b, e, c, o; }; // driver b/e/c + output node
 
     // Audio engine selection. Both modes share the precomputed static
     // transfer curve (see buildTransferTable):
@@ -58,13 +59,30 @@ public:
         const auto mid = ceSolve (0.0, dcSolution);
         ceDc = dcSolution; // physical fallback seed for unconverged solves
 
-        // Output stage gain around its quiescent collector voltage. Seed the
-        // solve from the physical quiescent state: the pair idles just at the
-        // edge of conduction, output ~0.62 V below the drive node.
-        ppDc = { mid.vc - 0.05, mid.vc - 0.67 };
-        ppSolve (mid.vc, ppDc);
+        // Output stage. The driver is fed the Class-A collector signal minus
+        // its DC level (the behavioural equivalent of the interstage
+        // coupling), so the driver's own divider sets the idle point and the
+        // solve below starts from the quiescent state at zero input.
+        ppInRef = mid.vc;
+        // The feedback path is AC-coupled (output transformer), referenced at
+        // the output node's own quiescent DC. That reference depends on the
+        // DC solve, and the DC solve depends on the reference -- but only
+        // weakly (the output node's sensitivity to it is ~rl/(rf*gm) << 1),
+        // so a fixed-point iteration from an analytic first guess (collector
+        // idle minus spreader drop minus the pair's conduction offset)
+        // converges in a couple of passes.
+        pp.nfbRef = 12.7;
+        for (int pass = 0; pass < 6; ++pass)
+        {
+            ppDc = { 1.5, 0.85, 13.0, 12.5 }; // rough hand estimate; polished below
+            ppSolve (0.0, ppDc);
+            const double prev = pp.nfbRef;
+            pp.nfbRef = ppDc[3];
+            if (std::abs (ppDc[3] - prev) < 1.0e-9)
+                break;
+        }
         ppDcQuiescent = ppDc; // physical fallback seed for unconverged solves
-        ppQuiescentVo = ppDc[1];
+        ppQuiescentVo = ppDc[3];
 
         // Precompute the static transfer curve (both stages are memoryless:
         // the only circuit memory lives in the one-pole filters). Built with
@@ -119,8 +137,9 @@ public:
     }
 
     // Debug hook (harness only): current DC operating point and calibration.
-    struct DebugState { double vb, ve, vc, vd, vo, norm; double res; };
-    DebugState debugState() const { return { dcSolution[0], dcSolution[1], dcSolution[2], ppDc[0], ppDc[1], normalization, lastResidual }; }
+    struct DebugState { double vb, ve, vc, pb, pe, pc, po, norm; double res; };
+    DebugState debugState() const
+    { return { dcSolution[0], dcSolution[1], dcSolution[2], ppDc[0], ppDc[1], ppDc[2], ppDc[3], normalization, lastResidual }; }
 
 #ifdef NEVE_TABLE_DEBUG
     // Validation hook (harness only): table output vs a live solve at an
@@ -206,13 +225,13 @@ public:
                 // in 1-2 iterations to the usual 1e-10 tolerance.
                 const auto tp = evalTable (drive);
                 even::NewtonSolver<3>::Vec ceSeed { tp.vb, tp.ve, tp.vc };
-                even::NewtonSolver<2>::Vec ppSeed { tp.vd, tp.vo };
+                even::NewtonSolver<4>::Vec ppSeed { tp.pb, tp.pe, tp.pc, tp.vo };
                 const auto op = ceSolve (drive, ceSeed);
-                const auto out = ppSolve (op.vc, ppSeed);
-                y = out.vo - ppQuiescentVo;
+                const auto out = ppSolve (op.vc - ppInRef, ppSeed);
+                y = out.o - ppQuiescentVo;
                 break;
             }
-            default: // Engine::Live -- original per-sample solves
+            case Engine::Live: // original per-sample solves
             {
                 y = solveOutput (drive);
                 break;
@@ -248,8 +267,8 @@ private:
     double solveOutput (double drive)
     {
         const auto op = ceSolve (drive, dcSolution);
-        const auto out = ppSolve (op.vc, ppDc);
-        return out.vo - ppQuiescentVo;
+        const auto out = ppSolve (op.vc - ppInRef, ppDc);
+        return out.o - ppQuiescentVo;
     }
 
     //==========================================================================
@@ -282,10 +301,10 @@ private:
     // ~1e-10.
     struct MicroWindow { double d0, d1; std::vector<double> vo; };
     static constexpr int microN = 1 << 14;   // points per micro window
-    // Node states vb/ve float (they only seed the Newton polish in Exact
-    // mode); vc/vd/vo in double: vo is the audio in Fast mode (a float ULP
+    // Node states vb/ve/pb/pe/pc float (they only seed the Newton polish in
+    // Exact mode); vc/vo in double: vo is the audio in Fast mode (a float ULP
     // near the 13 V rail is ~1e-6), and vc drives the push-pull stage.
-    struct TablePoint { double vb, ve, vc, vd, vo; };
+    struct TablePoint { double vb, ve, vc, pb, pe, pc, vo; };
 
     struct SharedTables
     {
@@ -322,8 +341,14 @@ private:
         auto resetSeeds = [&]
         {
             dcSolution = ceDc;
-            ppDc = ppDcQuiescent;
             lastCeVin = 0.0;
+            // NOTE: the push-pull solve is deliberately NOT reset here. Its
+            // cold solve (quiescent seed) does not converge in the driver's
+            // deep-saturation windows (drive ~100..105, ~151..154), while
+            // warm continuation from the previous knot converges everywhere
+            // to < 1e-9 -- the same warm tracking the audio path performs.
+            // Root-sheet drift is bounded by the residual-verified repair
+            // pass below.
         };
         // Cold solve: every main-table knot starts from the quiescent
         // operating point (plus the solver's internal homotopy). Warm
@@ -335,17 +360,17 @@ private:
         {
             resetSeeds();
             const auto op = ceSolve (drive, dcSolution);
-            const auto out = ppSolve (op.vc, ppDc);
+            const auto out = ppSolve (op.vc - ppInRef, ppDc);
             p.vb = op.vb; p.ve = op.ve;
-            p.vc = op.vc; p.vd = out.vd; p.vo = out.vo;
+            p.vc = op.vc; p.pb = out.b; p.pe = out.e; p.pc = out.c; p.vo = out.o;
         };
         // Warm solve (for the dense window, which sits well inside the
         // smooth region; outliers are caught by the scan below).
         auto warmVo = [&] (double drive) -> double
         {
             const auto op = ceSolve (drive, dcSolution);
-            const auto out = ppSolve (op.vc, ppDc);
-            return out.vo;
+            const auto out = ppSolve (op.vc - ppInRef, ppDc);
+            return out.o;
         };
         auto coldVo = [&] (double drive) -> double
         {
@@ -385,16 +410,21 @@ private:
             ceResidual (ce, drive, ceX, F3);
             const double rCe = even::NewtonSolver<3>::norm (F3);
 
-            even::NewtonSolver<2>::Vec ppX { p.vd, p.vo };
-            even::NewtonSolver<2>::Vec F2 {};
-            ppResidual (pp, p.vc, ppX, F2);
-            const double rPp = even::NewtonSolver<2>::norm (F2);
+            even::NewtonSolver<4>::Vec ppX { p.pb, p.pe, p.pc, p.vo };
+            even::NewtonSolver<4>::Vec F2 {};
+            ppResidual (pp, p.vc - ppInRef, ppX, F2);
+            const double rPp = even::NewtonSolver<4>::norm (F2);
 
-            if (rCe <= 1.0e-9 && rPp <= 1.0e-9)
+            // The push-pull threshold is looser than the Class-A one: in the
+            // driver's deep saturation the Jacobian is poorly conditioned and
+            // the residual bottoms out around 1e-8..1e-7 (a few nA on currents
+            // of mA) -- far below anything audible or representable downstream.
+            if (rCe <= 1.0e-9 && rPp <= 1.0e-7)
                 continue;
 
             solveInto (drive, p); // cold re-solve (seeds reset inside)
             ++repairedMain;
+            (void) repairedMain; // only read under NEVE_TABLE_DEBUG
         }
         // Micro windows around the remaining limiter kinks (outside the
         // dense window): detect clusters of large second difference in the
@@ -463,7 +493,9 @@ private:
         r.vb = (float) cr (p0.vb, p1.vb, p2.vb, p3.vb);
         r.ve = (float) cr (p0.ve, p1.ve, p2.ve, p3.ve);
         r.vc = (float) cr (p0.vc, p1.vc, p2.vc, p3.vc);
-        r.vd = (float) cr (p0.vd, p1.vd, p2.vd, p3.vd);
+        r.pb = (float) cr (p0.pb, p1.pb, p2.pb, p3.pb);
+        r.pe = (float) cr (p0.pe, p1.pe, p2.pe, p3.pe);
+        r.pc = (float) cr (p0.pc, p1.pc, p2.pc, p3.pc);
         r.vo = (float) cr (p0.vo, p1.vo, p2.vo, p3.vo);
         return r;
     }
@@ -727,24 +759,70 @@ public:
         return { seed[0], seed[1], seed[2] };
     }
     //==========================================================================
-    // BA283-style output stage: Class-AB complementary pair.
-    // Nodes: 0 = drive, 1 = output. Bias spreader ~2*Vbe splits the pair;
-    // each half conducts around its junction voltage. Local feedback
-    // resistor Rf from output back to the drive node.
+    // BA283-style output stage: driver + Class-AB complementary pair.
+    //
+    // Nodes: 0 = driver base, 1 = driver emitter, 2 = driver collector (the
+    // bias-spreader drive), 3 = output. The driver is a full Ebers-Moll BJT
+    // biased by its own divider (Rb1/Rb2) and degenerated by ReD; the global
+    // feedback resistor Rf returns the output to the driver emitter, so
+    // driver gain compression progressively fills in the pair's crossover
+    // notch as drive increases -- the characteristic BA283 behaviour a
+    // bare 2-node pair cannot reproduce. The driver collector feeds the
+    // spreader (~2*Vbe) and the pair, whose junction currents use the same
+    // reduced exponential model as before.
+    //
+    // The stage input is the Class-A collector signal minus its DC level
+    // (ppInRef): the behavioural equivalent of the interstage coupling, so
+    // the driver's divider alone sets the idle point.
     struct PushPullStage
     {
+        double vcc = 24.0;     // positive rail (driver collector load)
         double rs   = 600.0;   // drive source impedance
-        double rf   = 6.8e3;   // local feedback
+        double rb1  = 33.0e3;  // vcc -> driver base
+        double rb2  = 16.2e3;  // driver base -> gnd. Divider + reD set the
+                               // driver's idle: ve ~ 2.9 mA * reD ~ 7 V, so
+                               // vth sits at ~7.9 V (was a low-voltage divider
+                               // with reD = 270; the heavier degeneration is
+                               // what keeps the driver's voltage gain near
+                               // unity so the output stage saturates over the
+                               // intended drive range instead of slamming its
+                               // rails at drive ~0.35).
+        double vth  = 24.0 * 16.2e3 / (33.0e3 + 16.2e3); // divider Thevenin
+        double reD  = 2.4e3;   // driver emitter degeneration
+        double rcD  = 3.6e3;   // driver collector load
+        double rf   = 4.7e3;   // global feedback, output -> driver BASE.
+                               // Sign matters: the CE->driver->pair chain is
+                               // net inverting (the pair is an emitter
+                               // follower), so returning NFB to the driver's
+                               // EMITTER makes the loop positive (measured:
+                               // relaxation oscillation, 44% THD). Summed into
+                               // the base node it is negative, and the loop
+                               // gain is self-limiting: highest in the pair's
+                               // crossover notch (driver gain ~7, pair gm
+                               // collapsed -> |T| ~ 0.5, which is exactly the
+                               // notch-filling compression) and ~0.12 where
+                               // the pair conducts.
+        double nfbRef = 0.0;   // output quiescent DC (set in prepare): the
+                               // feedback path is AC-coupled through the
+                               // output transformer, so only the AC part of
+                               // the output reaches the driver base
         double rl   = 600.0;   // load (output transformer primary reflected)
         double bias = 0.62;    // ~2*Vbe/2 spreader drop per half
+        double reP  = 4.7;     // output device emitter degeneration. The
+                               // pair's raw exponential (gm ~ 0.85 S at the
+                               // ~20 mA idle) is a razor-edged crossover the
+                               // driver's gain then amplifies into a buzz;
+                               // degeneration flattens the turn-on exactly as
+                               // the physical emitter resistors do.
         double IsP  = 2.0e-6;  // power-device scaled saturation current
-        double beta = 100.0;
+        double beta = 100.0;   // output device beta
         double Vt   = 0.025852;
+        even::BjtModel drv { 3.5e-14, 100.0, 4.0, 0.025852 }; // driver BJT
     } pp;
 
     static void ppResidual (const PushPullStage& s, double vin,
-                            const even::NewtonSolver<2>::Vec& x,
-                            even::NewtonSolver<2>::Vec& F)
+                            const even::NewtonSolver<4>::Vec& x,
+                            even::NewtonSolver<4>::Vec& F)
     {
         ppEvaluate (s, vin, x, F, nullptr);
     }
@@ -752,58 +830,119 @@ public:
     // Residual and Jacobian in one pass: both use the same junction limiting
     // and exponential evaluations. J == nullptr means residual-only.
     static void ppEvaluate (const PushPullStage& s, double vin,
-                            const even::NewtonSolver<2>::Vec& x,
-                            even::NewtonSolver<2>::Vec& F,
-                            even::NewtonSolver<2>::Mat* J)
+                            const even::NewtonSolver<4>::Vec& x,
+                            even::NewtonSolver<4>::Vec& F,
+                            even::NewtonSolver<4>::Mat* J)
     {
-        const double vd = x[0], vo = x[1];
-        const double vN = even::BjtModel::lim (vd - vo - s.bias); // NPN junction
-        const double vP = even::BjtModel::lim (vo - vd - s.bias); // PNP junction
-        const double lN = even::BjtModel::limd (vd - vo - s.bias);
-        const double lP = even::BjtModel::limd (vo - vd - s.bias);
-        double eN, dN, eP, dP;
-        even::BjtModel::exPair (vN / s.Vt, eN, dN);
-        even::BjtModel::exPair (vP / s.Vt, eP, dP);
-        const double iN = s.IsP * (eN - 1.0);            // sources output node
-        const double iP = s.IsP * (eP - 1.0);            // sinks output node
-        const double iSum = iN - iP;
+        const double vb = x[0], ve = x[1], vc = x[2], vo = x[3];
 
-        // Drive node: input current + feedback current + base currents.
-        F[0] = (vd - vin) / s.rs + (vd - vo) / s.rf + iSum / (1.0 + s.beta);
-        // Output node: device current must feed load + feedback return.
-        F[1] = -iSum + vo / s.rl + (vo - vd) / s.rf;
+        // Driver: full Ebers-Moll (forward + reverse junction), so its
+        // saturation -- the collector bottoming against the emitter under
+        // drive -- is modelled properly. That saturation is the stage's
+        // gain-compression mechanism.
+        const auto op = s.drv.eval (vb - ve, vb - vc);
+
+        // Pair junctions, driven from the driver collector through the
+        // spreader offset (same reduced exponential model as before), each
+        // degenerated by its emitter resistor. The degenerated junction
+        // current i = IsP*(ex((vLim - i*reP)/Vt) - 1) is a monotone scalar
+        // equation (unique root, d/di = 1 + reP*gm > 0); it is solved by a
+        // short inner Newton and its analytic slope feeds the outer Jacobian.
+        const double uN = vc - vo - s.bias;
+        auto junc = [&s] (double vArg, double& di_dvArg)
+        {
+            const double v = even::BjtModel::lim (vArg);
+            const double limd = even::BjtModel::limd (vArg);
+            // i - f(v - reP*i) has slope 1 + reP*gm >= 1 (strictly
+            // increasing => unique root), but the stiff exponential needs
+            // several damped-free Newton steps from the undegenerated seed
+            // before its quadratic phase -- iterate to convergence, not to
+            // a fixed iteration count, or the outer solve stalls above its
+            // 1e-10 tolerance (measured: the whole table build re-solves).
+            double i = s.IsP * (std::exp (std::min (v / s.Vt, 30.0)) - 1.0);
+            for (int it = 0; it < 24; ++it)
+            {
+                const double x = std::min ((v - i * s.reP) / s.Vt, 30.0);
+                double e, d;
+                even::BjtModel::exPair (x, e, d);
+                const double f = s.IsP * (e - 1.0);       // target current
+                const double gm = s.IsP / s.Vt * d;       // d(target)/dvj
+                const double df = 1.0 + gm * s.reP;       // d(i - f)/di
+                const double step = (i - f) / df;
+                i -= step;
+                if (std::abs (step) < 1.0e-13)
+                    break;
+            }
+            const double x = std::min ((v - i * s.reP) / s.Vt, 30.0);
+            double e, d;
+            even::BjtModel::exPair (x, e, d);
+            const double gm = s.IsP / s.Vt * d;
+            di_dvArg = gm * limd / (1.0 + gm * s.reP);
+            return s.IsP * (e - 1.0);
+        };
+        double diN, diP;
+        const double iN = junc ( uN, diN);   // sources output node
+        const double iP = junc (-uN, diP);   // sinks output node
+        const double iSum = iN - iP;
+        const double gb = 1.0 / (1.0 + s.beta);
+
+        // Driver base: the drive is coupled in DC-free (interstage coupling),
+        // so the source is referenced at the divider's Thevenin voltage: it
+        // sets the idle point with rs carrying no DC current, while keeping
+        // the rs source impedance at signal frequencies.
+        F[0] = (vb - vin - s.vth) / s.rs + (vb - s.vcc) / s.rb1 + vb / s.rb2
+             + (vb + s.nfbRef - vo) / s.rf + op.ib;
+        // Driver emitter: degeneration to ground carries the emitter current
+        // (ic + ib). The global feedback returns to the BASE node (see the
+        // rf note above), not here.
+        F[1] = ve / s.reD - (op.ic + op.ib);
+        // Driver collector: load from the supply, collector current, and the
+        // pair's base current drawn through the spreader.
+        F[2] = (vc - s.vcc) / s.rcD + op.ic + iSum * gb;
+        // Output node: device current must feed load + feedback.
+        F[3] = -iSum + vo / s.rl + (vo - s.nfbRef - vb) / s.rf;
 
         if (J == nullptr)
             return;
 
-        const double gN = s.IsP / s.Vt * dN * lN;
-        const double gP = s.IsP / s.Vt * dP * lP;
-        const double gb = 1.0 / (1.0 + s.beta);
+        // Driver derivative shorthand (w.r.t. vbe = vb-ve, vbc = vb-vc).
+        const double ibB = op.dib_dvbe, ibC = op.dib_dvbc;
+        const double icB = op.dic_dvbe, icC = op.dic_dvbc;
+        // Pair transconductance: diSum/dvc = g, diSum/dvo = -g (degenerated
+        // junction slopes; both junctions share the differential drive uN).
+        const double g = diN + diP;
 
         auto& j = *J;
         for (auto& row : j) row.fill (0.0);
 
-        // diSum/dvd = gN + gP ; diSum/dvo = -(gN + gP)
-        const double g = gN + gP;
-
-        j[0][0] = 1.0 / s.rs + 1.0 / s.rf + g * gb;
-        j[0][1] = -1.0 / s.rf - g * gb;
-        j[1][0] = -g - 1.0 / s.rf;
-        j[1][1] = g + 1.0 / s.rl + 1.0 / s.rf;
+        j[0][0] = 1.0 / s.rs + 1.0 / s.rb1 + 1.0 / s.rb2 + 1.0 / s.rf + ibB + ibC;
+        j[0][1] = -ibB;
+        j[0][2] = -ibC;
+        j[0][3] = -1.0 / s.rf;
+        j[1][0] = -(icB + icC) - (ibB + ibC);
+        j[1][1] = 1.0 / s.reD + icB + ibB;
+        j[1][2] = icC + ibC;
+        j[2][0] = icB + icC;
+        j[2][1] = -icB;
+        j[2][2] = 1.0 / s.rcD - icC + g * gb;
+        j[2][3] = -g * gb;
+        j[3][0] = -1.0 / s.rf;
+        j[3][2] = -g;
+        j[3][3] = g + 1.0 / s.rl + 1.0 / s.rf;
     }
 
-    PpState ppSolve (double vin, even::NewtonSolver<2>::Vec& seed) const
+    PpState ppSolve (double vin, even::NewtonSolver<4>::Vec& seed) const
     {
-        auto evaluate = [&] (const even::NewtonSolver<2>::Vec& x,
-                             even::NewtonSolver<2>::Vec& F,
-                             even::NewtonSolver<2>::Mat& J)
+        auto evaluate = [&] (const even::NewtonSolver<4>::Vec& x,
+                             even::NewtonSolver<4>::Vec& F,
+                             even::NewtonSolver<4>::Mat& J)
         { ppEvaluate (pp, vin, x, F, &J); };
-        auto residualOnly = [&] (const even::NewtonSolver<2>::Vec& x,
-                                 even::NewtonSolver<2>::Vec& F)
+        auto residualOnly = [&] (const even::NewtonSolver<4>::Vec& x,
+                                 even::NewtonSolver<4>::Vec& F)
         { ppEvaluate (pp, vin, x, F, nullptr); };
 
         auto firstAttempt = seed;
-        auto r1 = even::NewtonSolver<2>::solveCombined (evaluate, residualOnly, firstAttempt);
+        auto r1 = even::NewtonSolver<4>::solveCombined (evaluate, residualOnly, firstAttempt);
 
         // Same nonphysical-iterate guard as the Class-A stage: retry from the
         // quiescent state, but prefer a *converged* attempt over one that
@@ -811,7 +950,7 @@ public:
         if (! r1.converged)
         {
             auto retry = ppDcQuiescent;
-            auto r2 = even::NewtonSolver<2>::solveCombined (evaluate, residualOnly, retry, 64);
+            auto r2 = even::NewtonSolver<4>::solveCombined (evaluate, residualOnly, retry, 64);
             if (r2.converged)
             {
                 firstAttempt = retry;
@@ -825,11 +964,12 @@ public:
         }
 
         seed = firstAttempt;
-        // The output node is fed by junction current sources into rl/rf; it
-        // has no path outside the supply-referenced range in any real root.
-        seed[0] = std::clamp (seed[0], -1.0, pp.bias + 24.0 + 1.0);
-        seed[1] = std::clamp (seed[1], -1.0, 24.0 + 1.0);
-        return { seed[0], seed[1] };
+        // Physical range guards: the driver and output nodes have no path
+        // outside the supply-referenced range in any real root (the output
+        // node is fed by junction current sources into rl/rf only).
+        for (int i = 0; i < 4; ++i)
+            seed[(size_t) i] = std::clamp (seed[(size_t) i], -20.0, pp.vcc + 1.0);
+        return { seed[0], seed[1], seed[2], seed[3] };
     }
 
     //==========================================================================
@@ -846,9 +986,10 @@ public:
 
     even::NewtonSolver<3>::Vec dcSolution {};
     even::NewtonSolver<3>::Vec ceDc {};         // quiescent fallback seed
-    even::NewtonSolver<2>::Vec ppDc {};
-    even::NewtonSolver<2>::Vec ppDcQuiescent {}; // quiescent fallback seed
+    even::NewtonSolver<4>::Vec ppDc {};
+    even::NewtonSolver<4>::Vec ppDcQuiescent {}; // quiescent fallback seed
     double ppQuiescentVo = 0.0;
+    double ppInRef = 13.0;                      // Class-A collector DC level
     mutable double lastCeVin = 0.0;             // previous input for homotopy
     mutable double lastResidual = 0.0;          // debug: accepted state's residual
 };
