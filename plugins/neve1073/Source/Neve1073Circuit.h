@@ -63,6 +63,11 @@ public:
         // `normalization`. (The reset at the end of prepare only cleans up
         // for playback; it happens too late for the calibration itself.)
         lastCeVin = 0.0;
+        // Cold-start the push-pull junction warm-start caches too: a stale
+        // cache from a previously prepared rate would extrapolate from a
+        // far-away operating point on the first samples (harmless -- the
+        // solve still converges to the same unique root -- but wasteful).
+        pp.jnV = pp.jpV = std::numeric_limits<double>::quiet_NaN();
 
         // DC operating point of the Class-A stage (signal source at 0 V),
         // starting from a rough hand-computed bias estimate.
@@ -106,6 +111,8 @@ public:
             table = st.main;
             dense = st.dense;
             micro = st.micro;
+            for (int f = 0; f < 7; ++f)
+                seedCoefPtr[f] = st.seedCoef[f].data();
         }
 
         // Transformer models. These must be prepared BEFORE the calibration
@@ -387,6 +394,10 @@ private:
         std::vector<TablePoint> main;
         std::vector<double> dense;
         std::vector<MicroWindow> micro;
+        // Precomputed Catmull-Rom polynomial coefficients (c1..c3) per field
+        // per knot, for the Exact engine's seed lookup. c0 is the knot value
+        // itself, already stored in `main`. 3 floats x 7 fields x tableN.
+        std::vector<float> seedCoef[7];
     };
 
     // The curve depends on neither sample rate nor gain, so one table is
@@ -403,6 +414,8 @@ private:
             shared.main = std::move (scratch.table);
             shared.dense = std::move (scratch.dense);
             shared.micro = std::move (scratch.micro);
+            for (int f = 0; f < 7; ++f)
+                shared.seedCoef[f] = std::move (scratch.seedCoef[f]);
         });
         return shared;
     }
@@ -543,10 +556,54 @@ private:
         fprintf (stderr, "table build: repaired %zu main, %zu micro windows\n",
                  repairedMain, micro.size());
 #endif
+
+        // Precompute the per-knot Catmull-Rom polynomial coefficients for the
+        // Exact engine's seed lookup: value(u) between knots i and i+1 is
+        //   b + u*((c-a)/2 + u*((2a-5b+4c-d)/2 + u*(3b-a-3c+d)/2))
+        // with a..d the clamped neighbouring knots -- the exact polynomial the
+        // old on-the-fly reconstruction evaluated, just factored for Horner
+        // with c0 = the knot value. Storing c1..c3 (float) turns evalTable
+        // into 3 FMAs per field instead of a 4-knot reconstruction.
+        for (int f = 0; f < 7; ++f)
+            seedCoef[f].assign ((size_t) 3 * tableN, 0.0f);
+        for (int i = 0; i < tableN; ++i)
+        {
+            const auto& pa = table[(size_t) std::max (i - 1, 0)];
+            const auto& pb = table[(size_t) i];
+            const auto& pc = table[(size_t) std::min (i + 1, tableN - 1)];
+            const auto& pd = table[(size_t) std::min (i + 2, tableN - 1)];
+            for (int f = 0; f < 7; ++f)
+            {
+                const double va = tpField (pa, f), vb = tpField (pb, f);
+                const double vc = tpField (pc, f), vd = tpField (pd, f);
+                float* cf = seedCoef[f].data() + 3 * (size_t) i;
+                cf[0] = (float) (0.5 * (vc - va));
+                cf[1] = (float) (0.5 * (2.0 * va - 5.0 * vb + 4.0 * vc - vd));
+                cf[2] = (float) (0.5 * (3.0 * vb - va - 3.0 * vc + vd));
+            }
+        }
+    }
+
+    // Field accessor for the coefficient build (field order matches the
+    // TablePoint member order: vb, ve, vc, pb, pe, pc, vo).
+    static double tpField (const TablePoint& p, int f)
+    {
+        switch (f)
+        {
+            case 0: return p.vb;
+            case 1: return p.ve;
+            case 2: return p.vc;
+            case 3: return p.pb;
+            case 4: return p.pe;
+            case 5: return p.pc;
+            default: return p.vo;
+        }
     }
 
     // Catmull-Rom interpolation of the table state at `drive`. Smooth (C1),
-    // exact at the knots, clamped outside the domain.
+    // exact at the knots, clamped outside the domain. Uses the per-knot
+    // precomputed coefficients when available (3 FMAs per field); identical
+    // polynomial to the on-the-fly reconstruction below.
     TablePoint evalTable (double drive) const
     {
         const double t = std::clamp ((drive - tableDMin) * ((tableN - 1) / (tableDMax - tableDMin)),
@@ -554,6 +611,27 @@ private:
         const int i = (int) t;
         const double u = t - (double) i;
 
+        if (seedCoefPtr[0] != nullptr)
+        {
+            const TablePoint& p1 = table[(size_t) i];
+            auto ev = [this, i, u] (int f, double knot)
+            {
+                const float* cf = seedCoefPtr[f] + 3 * (size_t) i;
+                return knot + u * ((double) cf[0] + u * ((double) cf[1] + u * (double) cf[2]));
+            };
+            TablePoint r;
+            r.vb = (float) ev (0, p1.vb);
+            r.ve = (float) ev (1, p1.ve);
+            r.vc = (float) ev (2, p1.vc);
+            r.pb = (float) ev (3, p1.pb);
+            r.pe = (float) ev (4, p1.pe);
+            r.pc = (float) ev (5, p1.pc);
+            r.vo = (float) ev (6, p1.vo);
+            return r;
+        }
+
+        // Fallback (coefficient build not run -- e.g. the table-build scratch
+        // instance): the original 4-knot Catmull-Rom reconstruction.
         const auto p0 = table[(size_t) std::max (i - 1, 0)];
         const auto p1 = table[(size_t) i];
         const auto p2 = table[(size_t) std::min (i + 1, tableN - 1)];
@@ -638,6 +716,10 @@ public:
     std::vector<TablePoint> table;
     std::vector<double> dense; // vo only (Fast engine reads just the output node)
     std::vector<MicroWindow> micro;
+    std::vector<float> seedCoef[7]; // built by buildTransferTable, moved into sharedTables
+    // Precomputed seed-interpolation coefficients (into sharedTables, which
+    // outlives every instance); null until prepare(buildTable=true).
+    const float* seedCoefPtr[7] = {};
 
 public:
     //==========================================================================
@@ -914,7 +996,64 @@ public:
         // still behaves physically; only the pathological deep-saturation
         // region is limited.
         even::BjtModel drv { 3.5e-14, 100.0, 4.0, 0.025852, 8.0e-3 };
+
+        // Warm-start caches for the pair's degenerated junction solves: the
+        // last (drive argument, root current, dI/dvArg) per junction. Mutable:
+        // updated from inside the otherwise-const ppEvaluate. NaN vArg = cold.
+        mutable double jnV = std::numeric_limits<double>::quiet_NaN();
+        mutable double jnI = 0.0, jnS = 0.0;
+        mutable double jpV = std::numeric_limits<double>::quiet_NaN();
+        mutable double jpI = 0.0, jpS = 0.0;
     } pp;
+
+    // One degenerated pair junction: solve i - IsP*(ex((vLim(vArg) - i*reP)/Vt) - 1) = 0
+    // for the junction current i. Strictly monotone in i (slope 1 + reP*gm >= 1)
+    // => unique root, so ANY converged result is THE root regardless of seed --
+    // warm starting changes only the iteration count, never the answer.
+    //
+    // Warm start: the root's slope di/dvArg is smooth in vArg, so a linear
+    // extrapolation from the cache's previous (vArg, i) pair lands within a
+    // fraction of the degeneration width of the new root and the Newton hits
+    // its quadratic phase immediately (1-2 iterations instead of the 5+ a
+    // cold undegenerated seed needs). |dV| beyond 4 V (region switch, table
+    // build jumps) falls back to the physical cold seed.
+    static double juncSolve (const PushPullStage& s,
+                             double& cacheV, double& cacheI, double& cacheS,
+                             double vArg, double& di_dvArg)
+    {
+        const double v    = even::BjtModel::lim (vArg);
+        const double limd = even::BjtModel::limd (vArg);
+
+        double i;
+        const double dV = vArg - cacheV;
+        if (dV == dV && std::abs (dV) < 4.0) // NaN compare: cold cache
+            i = cacheI + cacheS * dV;
+        else
+            i = s.IsP * (std::exp (std::min (v / s.Vt, 30.0)) - 1.0);
+
+        for (int it = 0; it < 24; ++it)
+        {
+            const double x = std::min ((v - i * s.reP) / s.Vt, 30.0);
+            double e, d;
+            even::BjtModel::exPair (x, e, d);
+            const double f    = s.IsP * (e - 1.0);  // target current
+            const double gm   = s.IsP / s.Vt * d;   // d(target)/dvj
+            const double df   = 1.0 + gm * s.reP;   // d(i - f)/di
+            const double step = (i - f) / df;
+            i -= step;
+            if (std::abs (step) < 1.0e-13)
+                break;
+        }
+        const double x = std::min ((v - i * s.reP) / s.Vt, 30.0);
+        double e, d;
+        even::BjtModel::exPair (x, e, d);
+        const double gm = s.IsP / s.Vt * d;
+        di_dvArg = gm * limd / (1.0 + gm * s.reP);
+        cacheV = vArg;
+        cacheI = i;
+        cacheS = di_dvArg;
+        return s.IsP * (e - 1.0);
+    }
 
     static void ppResidual (const PushPullStage& s, double vin,
                             const even::NewtonSolver<4>::Vec& x,
@@ -945,40 +1084,9 @@ public:
         // equation (unique root, d/di = 1 + reP*gm > 0); it is solved by a
         // short inner Newton and its analytic slope feeds the outer Jacobian.
         const double uN = vc - vo - s.bias;
-        auto junc = [&s] (double vArg, double& di_dvArg)
-        {
-            const double v = even::BjtModel::lim (vArg);
-            const double limd = even::BjtModel::limd (vArg);
-            // i - f(v - reP*i) has slope 1 + reP*gm >= 1 (strictly
-            // increasing => unique root), but the stiff exponential needs
-            // several damped-free Newton steps from the undegenerated seed
-            // before its quadratic phase -- iterate to convergence, not to
-            // a fixed iteration count, or the outer solve stalls above its
-            // 1e-10 tolerance (measured: the whole table build re-solves).
-            double i = s.IsP * (std::exp (std::min (v / s.Vt, 30.0)) - 1.0);
-            for (int it = 0; it < 24; ++it)
-            {
-                const double x = std::min ((v - i * s.reP) / s.Vt, 30.0);
-                double e, d;
-                even::BjtModel::exPair (x, e, d);
-                const double f = s.IsP * (e - 1.0);       // target current
-                const double gm = s.IsP / s.Vt * d;       // d(target)/dvj
-                const double df = 1.0 + gm * s.reP;       // d(i - f)/di
-                const double step = (i - f) / df;
-                i -= step;
-                if (std::abs (step) < 1.0e-13)
-                    break;
-            }
-            const double x = std::min ((v - i * s.reP) / s.Vt, 30.0);
-            double e, d;
-            even::BjtModel::exPair (x, e, d);
-            const double gm = s.IsP / s.Vt * d;
-            di_dvArg = gm * limd / (1.0 + gm * s.reP);
-            return s.IsP * (e - 1.0);
-        };
         double diN, diP;
-        const double iN = junc ( uN, diN);   // sources output node
-        const double iP = junc (-uN, diP);   // sinks output node
+        const double iN = juncSolve (s, s.jnV, s.jnI, s.jnS,  uN, diN); // sources output node
+        const double iP = juncSolve (s, s.jpV, s.jpI, s.jpS, -uN, diP); // sinks output node
         const double iSum = iN - iP;
         const double gb = 1.0 / (1.0 + s.beta);
 

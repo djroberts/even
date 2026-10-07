@@ -78,6 +78,28 @@ public:
             if (! solveLinear (J, F, dx))
                 return r; // singular Jacobian, keep last x
 
+            // Step-size early exit: dx solves J*dx = F, so at the updated
+            // point x - dx the residual is purely the second-order term
+            // O(curvature * dx^2) -- when the step is negligible next to the
+            // state magnitude, the updated iterate IS the root to far below
+            // the residual tolerance. Accept it without spending another
+            // full residual+Jacobian evaluation (saves one evaluate per
+            // solve in the common table-seeded case, where the polish lands
+            // here after 1 iteration).
+            // NB: r.residualNorm stays the pre-step value; callers only use
+            // it to rank fallback candidates, and the true post-step
+            // residual is below it to second order.
+            double dxn = 0.0, xn = 0.0;
+            for (int i = 0; i < N; ++i) { dxn += dx[(size_t) i] * dx[(size_t) i]; xn += x[(size_t) i] * x[(size_t) i]; }
+            if (std::sqrt (dxn) <= 1.0e-10 * (1.0 + std::sqrt (xn)))
+            {
+                for (int i = 0; i < N; ++i)
+                    x[(size_t) i] -= dx[(size_t) i];
+                r.converged = true;
+                r.iterations = iter + 1;
+                return r;
+            }
+
             bool improved = false;
             double lambda = 1.0;
             for (int ls = 0; ls < 8; ++ls)
